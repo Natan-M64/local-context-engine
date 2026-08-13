@@ -1,0 +1,33 @@
+{
+  "name": "sanitized-windows-multiread-session",
+  "runtimeContext": 25000,
+  "outputReserve": 4096,
+  "safetyReserve": 2048,
+  "systemCharacters": 12000,
+  "toolOutputs": [
+    {
+      "id": "sql-dump",
+      "kind": "sql",
+      "characters": 88000
+    },
+    {
+      "id": "users-json",
+      "kind": "json",
+      "characters": 76000
+    },
+    {
+      "id": "groups-json",
+      "kind": "json",
+      "characters": 48000
+    },
+    {
+      "id": "tracker-log",
+      "kind": "log",
+      "characters": 56000
+    }
+  ],
+  "recentEvidence": {
+    "toolCallId": "target-user",
+    "content": "{\"id\":1174,\"groupId\":1044,\"name\":\"SANITIZED TARGET USER\",\"email\":\"target.user@example.invalid\"}"
+  }
+}

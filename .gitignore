@@ -1,0 +1,5 @@
+node_modules/
+dist/
+.serena/
+.env
+.DS_Store
