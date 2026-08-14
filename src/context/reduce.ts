@@ -3,14 +3,14 @@ import type { ContextBudget } from "./budget.js"
 import { CharacterTokenEstimator, classifyToolEvidence, estimateRequestTokens, type TokenEstimator } from "./measure.js"
 import type { ContentStore } from "../eviction/store.js"
 
-export type ReductionClass = "SAFE" | "LIVE_EVIDENCE" | "CAUTIOUS" | "PROTECTED"
+export type ReductionClass = "SAFE" | "LIVE_EVIDENCE" | "HISTORICAL_ARGUMENT" | "CAUTIOUS" | "PROTECTED"
 
 export interface EvictionRecord {
   messageIndex: number
   handle: string
   originalTokens: number
   retainedTokens: number
-  reductionClass: "SAFE" | "LIVE_EVIDENCE"
+  reductionClass: "SAFE" | "LIVE_EVIDENCE" | "HISTORICAL_ARGUMENT"
 }
 
 export interface ReductionResult {
@@ -80,6 +80,22 @@ function compactArchivedContent(handle: string): string {
   return `[Content archived]\nHandle: ${handle}`
 }
 
+function archivedArgumentContent(handle: string): string {
+  return JSON.stringify({
+    _archived: true,
+    handle,
+  })
+}
+
+function parseValidJsonObject(value: string): boolean {
+  try {
+    const parsed = JSON.parse(value)
+    return parsed !== null && typeof parsed === "object"
+  } catch {
+    return false
+  }
+}
+
 export async function reduceRequestToBudget(
   request: ChatCompletionRequest,
   budget: ContextBudget,
@@ -116,6 +132,7 @@ export async function reduceRequestToBudget(
     const evidence = classifyToolEvidence(reduced.messages)
     const safeIndexes = new Set(evidence.safeMessageIndexes)
     const liveEvidenceIndexes = new Set(evidence.liveEvidenceMessageIndexes)
+    const historicalAssistantIndexes = new Set(evidence.historicalAssistantMessageIndexes)
     const candidates = allToolCandidates
       .filter((candidate) => safeIndexes.has(candidate.messageIndex))
       .sort((left, right) => {
@@ -144,6 +161,11 @@ export async function reduceRequestToBudget(
         preview(originalContent, previewCharacters),
       )
       candidate.message.content = replacement
+      const measuredTokens = (await measure(reduced)).tokens
+      if (measuredTokens >= afterTokens) {
+        candidate.message.content = originalContent
+        continue
+      }
       const record: EvictionRecord = {
         messageIndex: candidate.messageIndex,
         handle: stored.handle,
@@ -153,12 +175,13 @@ export async function reduceRequestToBudget(
       }
       evictions.push(record)
       archived.push({ candidate, originalContent, handle: stored.handle, bytes: stored.bytes, originalTokens, record })
-      afterTokens = (await measure(reduced)).tokens
+      afterTokens = measuredTokens
     }
 
     for (const retainedCharacters of [minimumPreviewCharacters, emergencyPreviewCharacters]) {
       for (const entry of archived) {
         if (afterTokens <= targetTokens) break
+        const previous = entry.candidate.message.content
         const replacement = archivedContent(
           entry.handle,
           entry.bytes,
@@ -166,18 +189,61 @@ export async function reduceRequestToBudget(
           preview(entry.originalContent, retainedCharacters),
         )
         entry.candidate.message.content = replacement
+        const measuredTokens = (await measure(reduced)).tokens
+        if (measuredTokens >= afterTokens) {
+          entry.candidate.message.content = previous
+          continue
+        }
         entry.record.retainedTokens = estimator.estimateText(replacement)
-        afterTokens = (await measure(reduced)).tokens
+        afterTokens = measuredTokens
       }
     }
 
     if (options.compactArchiveMetadata !== false) {
       for (const entry of archived) {
         if (afterTokens <= targetTokens) break
+        const previous = entry.candidate.message.content
         const replacement = compactArchivedContent(entry.handle)
         entry.candidate.message.content = replacement
+        const measuredTokens = (await measure(reduced)).tokens
+        if (measuredTokens >= afterTokens) {
+          entry.candidate.message.content = previous
+          continue
+        }
         entry.record.retainedTokens = estimator.estimateText(replacement)
-        afterTokens = (await measure(reduced)).tokens
+        afterTokens = measuredTokens
+      }
+    }
+
+    if (afterTokens > budget.safeInput) {
+      const historicalArguments = reduced.messages.flatMap((message, messageIndex) => {
+        if (message.role !== "assistant" || !Array.isArray(message.tool_calls) || !historicalAssistantIndexes.has(messageIndex)) return []
+        return (message.tool_calls as Array<Record<string, unknown>>).flatMap((call, callIndex) => {
+          const fn = call.function
+          if (!fn || typeof fn !== "object" || typeof (fn as Record<string, unknown>).arguments !== "string") return []
+          return [{ message, messageIndex, call, callIndex, original: (fn as Record<string, unknown>).arguments as string }]
+        })
+      })
+      for (const entry of historicalArguments) {
+        if (afterTokens <= budget.safeInput) break
+        const stored = await store.put(entry.original)
+        const marker = archivedArgumentContent(stored.handle)
+        if (!parseValidJsonObject(marker)) continue
+        const fn = entry.call.function as Record<string, unknown>
+        fn.arguments = marker
+        const measuredTokens = (await measure(reduced)).tokens
+        if (measuredTokens >= afterTokens) {
+          fn.arguments = entry.original
+          continue
+        }
+        evictions.push({
+          messageIndex: entry.messageIndex,
+          handle: stored.handle,
+          originalTokens: estimator.estimateText(entry.original),
+          retainedTokens: estimator.estimateText(marker),
+          reductionClass: "HISTORICAL_ARGUMENT",
+        })
+        afterTokens = measuredTokens
       }
     }
 
@@ -189,74 +255,37 @@ export async function reduceRequestToBudget(
         .sort((left, right) => right.messageIndex - left.messageIndex)
       const liveSafetyMargin = Math.max(0, Math.floor(options.liveEvidenceSafetyMarginTokens ?? 64))
       const liveFitLimit = Math.max(1, budget.safeInput - liveSafetyMargin)
-      const liveEntries = [] as Array<{
-        candidate: (typeof liveCandidates)[number]
-        originalContent: string
-        handle: string
-        originalTokens: number
-        emptyMarker: string
-        record: EvictionRecord
-      }>
-
-      // First establish the minimum LIVE_EVIDENCE footprint. This tells us
-      // whether the protected request + semantic archive markers can fit at all.
       for (const candidate of liveCandidates) {
+        if (afterTokens <= budget.safeInput) break
         const originalContent = candidate.content
         const originalTokens = estimator.estimateText(originalContent)
+        const baselineTokens = afterTokens
         const stored = await store.put(originalContent)
         const emptyMarker = liveEvidenceContentWithoutExcerpt(stored.handle, originalTokens)
         candidate.message.content = emptyMarker
-        const record: EvictionRecord = {
-          messageIndex: candidate.messageIndex,
-          handle: stored.handle,
-          originalTokens,
-          retainedTokens: estimator.estimateText(emptyMarker),
-          reductionClass: "LIVE_EVIDENCE",
+        const markerTokens = (await measure(reduced)).tokens
+        if (markerTokens >= baselineTokens) {
+          candidate.message.content = originalContent
+          continue
         }
-        evictions.push(record)
-        liveEntries.push({
-          candidate,
-          originalContent,
-          handle: stored.handle,
-          originalTokens,
-          emptyMarker,
-          record,
-        })
-      }
 
-      afterTokens = (await measure(reduced)).tokens
-
-      // Only restore excerpts when the marker-only request already fits.
-      // Crucially, every trial is checked with the same whole-request
-      // authoritative measurement used by Measure/Budget/Verify. The previous
-      // implementation converted an exact remaining budget into heuristic
-      // CharacterTokenEstimator tokens, which could preserve too much live
-      // evidence and still fail final Verify.
-      if (afterTokens <= budget.safeInput) {
-        for (const entry of liveEntries) {
-          // If the configured safety margin is already consumed by the
-          // marker-only request, preserve markers only rather than turning the
-          // margin into another hard failure.
-          if (afterTokens > liveFitLimit) break
-
+        let bestReplacement = emptyMarker
+        let bestRetainedTokens = estimator.estimateText(emptyMarker)
+        let bestMeasuredTokens = markerTokens
+        if (markerTokens <= liveFitLimit) {
           let low = 0
-          let high = entry.originalContent.length
-          let bestReplacement = entry.emptyMarker
-          let bestRetainedTokens = estimator.estimateText(entry.emptyMarker)
-          let bestMeasuredTokens = afterTokens
-
+          let high = originalContent.length
           while (low <= high) {
             const retainedCharacters = Math.floor((low + high) / 2)
             const replacement = liveEvidenceContent(
-              entry.handle,
-              entry.originalTokens,
-              preview(entry.originalContent, retainedCharacters),
+              stored.handle,
+              originalTokens,
+              preview(originalContent, retainedCharacters),
               estimator,
             )
-            entry.candidate.message.content = replacement
+            candidate.message.content = replacement
             const measuredTokens = (await measure(reduced)).tokens
-
-            if (measuredTokens <= liveFitLimit) {
+            if (measuredTokens < baselineTokens && measuredTokens <= liveFitLimit) {
               bestReplacement = replacement
               bestRetainedTokens = estimator.estimateText(replacement)
               bestMeasuredTokens = measuredTokens
@@ -265,14 +294,18 @@ export async function reduceRequestToBudget(
               high = retainedCharacters - 1
             }
           }
-
-          entry.candidate.message.content = bestReplacement
-          entry.record.retainedTokens = bestRetainedTokens
-          afterTokens = bestMeasuredTokens
         }
-      }
 
-      afterTokens = (await measure(reduced)).tokens
+        candidate.message.content = bestReplacement
+        evictions.push({
+          messageIndex: candidate.messageIndex,
+          handle: stored.handle,
+          originalTokens,
+          retainedTokens: bestRetainedTokens,
+          reductionClass: "LIVE_EVIDENCE",
+        })
+        afterTokens = bestMeasuredTokens
+      }
     }
   }
 

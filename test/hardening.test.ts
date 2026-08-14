@@ -190,7 +190,7 @@ test("old user prompts remain protected when target cannot be reached", async ()
   })
 })
 
-test("tool-call arguments and protocol identifiers remain protected", async () => {
+test("historical tool-call arguments archive without changing caller-owned protocol data", async () => {
   await withStore(async (store) => {
     const argumentsValue = JSON.stringify({ patch: "P".repeat(12_000) })
     const request: ChatCompletionRequest = {
@@ -201,10 +201,16 @@ test("tool-call arguments and protocol identifiers remain protected", async () =
       ],
     }
     const localBudget = createContextBudget({ effectiveContext: 1_000, outputReserve: 200, safetyReserve: 100 })
-    await assert.rejects(reduceRequestToBudget(request, localBudget, store), ContextBudgetExceededError)
-    const call = (request.messages[0]!.tool_calls as Array<{ id: string; function: { arguments: string } }>)[0]!
-    assert.equal(call.id, "call_old")
-    assert.equal(call.function.arguments, argumentsValue)
-    assert.equal(request.messages[1]!.tool_call_id, "call_old")
+    const result = await reduceRequestToBudget(request, localBudget, store)
+    const eviction = result.evictions.find((entry) => entry.reductionClass === "HISTORICAL_ARGUMENT")
+    assert.ok(eviction)
+    const originalCall = (request.messages[0]!.tool_calls as Array<{ id: string; function: { arguments: string } }>)[0]!
+    const reducedCall = (result.request.messages[0]!.tool_calls as Array<{ id: string; function: { arguments: string } }>)[0]!
+    assert.equal(originalCall.id, "call_old")
+    assert.equal(originalCall.function.arguments, argumentsValue)
+    assert.equal(reducedCall.id, "call_old")
+    assert.match(reducedCall.function.arguments, /ctx:\/\/sha256\//)
+    assert.equal(result.request.messages[1]!.tool_call_id, "call_old")
+    assert.equal(await store.get(eviction.handle), argumentsValue)
   })
 })

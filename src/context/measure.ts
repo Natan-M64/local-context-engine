@@ -52,6 +52,7 @@ export interface TokenBreakdown {
 export interface ToolEvidenceClassification {
   safeMessageIndexes: number[]
   liveEvidenceMessageIndexes: number[]
+  historicalAssistantMessageIndexes: number[]
 }
 
 const BREAKDOWN_KEYS = [
@@ -102,15 +103,26 @@ export function classifyToolEvidence(messages: ChatMessage[]): ToolEvidenceClass
   const currentToolRoundStart = messages.findLastIndex(hasToolCalls)
   const latestUserIndex = messages.findLastIndex((message) => message.role === "user")
   const latestToolIndex = toolMessageIndexes.at(-1) ?? -1
-  const safeMessageIndexes = currentToolRoundStart >= 0
-    ? toolMessageIndexes.filter((messageIndex) => messageIndex < currentToolRoundStart)
-    : latestUserIndex > latestToolIndex
-      ? toolMessageIndexes
+  const safeMessageIndexes = latestUserIndex > latestToolIndex
+    ? toolMessageIndexes
+    : currentToolRoundStart >= 0
+      ? toolMessageIndexes.filter((messageIndex) => messageIndex < currentToolRoundStart)
       : toolMessageIndexes.slice(0, -1)
   const safe = new Set(safeMessageIndexes)
+  const safeToolCallIds = new Set(safeMessageIndexes.flatMap((messageIndex) => {
+    const id = messages[messageIndex]?.tool_call_id
+    return typeof id === "string" ? [id] : []
+  }))
+  const historicalAssistantMessageIndexes = messages.flatMap((message, messageIndex) => {
+    if (message.role !== "assistant" || !Array.isArray(message.tool_calls)) return []
+    const calls = message.tool_calls.filter((call): call is Record<string, unknown> => Boolean(call) && typeof call === "object")
+    if (calls.length === 0) return []
+    return calls.every((call) => typeof call.id === "string" && safeToolCallIds.has(call.id)) ? [messageIndex] : []
+  })
   return {
     safeMessageIndexes,
     liveEvidenceMessageIndexes: toolMessageIndexes.filter((messageIndex) => !safe.has(messageIndex)),
+    historicalAssistantMessageIndexes,
   }
 }
 

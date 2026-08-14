@@ -280,6 +280,179 @@ test("does not archive LIVE_EVIDENCE to chase targetTokens below safeInput", asy
   })
 })
 
+test("rejects non-beneficial LIVE_EVIDENCE archival using whole-request measurement", async () => {
+  await withStore(async (store) => {
+    const currentOutput = "tiny"
+    const request: ChatCompletionRequest = {
+      messages: [
+        { role: "system", content: "S".repeat(2_900) },
+        { role: "assistant", tool_calls: [{ id: "current", type: "function", function: { name: "read", arguments: "{}" } }] },
+        { role: "tool", tool_call_id: "current", content: currentOutput },
+      ],
+    }
+    const measureRequest = async (candidate: ChatCompletionRequest): Promise<{ tokens: number }> => {
+      const content = String(candidate.messages[2]!.content)
+      return { tokens: content === currentOutput ? 710 : 790 }
+    }
+    await assert.rejects(
+      reduceRequestToBudget(request, budget, store, { measureRequest }),
+      (error: unknown) => error instanceof ContextBudgetExceededError
+        && error.result.afterTokens === 710
+        && error.result.evictions.length === 0
+        && error.result.request.messages[2]!.content === currentOutput,
+    )
+  })
+})
+
+test("archives only historical tool arguments under hard overflow", async () => {
+  await withStore(async (store) => {
+    const historicalArguments = JSON.stringify({ patch: "P".repeat(4_000) })
+    const currentArguments = JSON.stringify({ path: "current.txt", content: "C".repeat(500) })
+    const request: ChatCompletionRequest = {
+      messages: [
+        { role: "system", content: "system" },
+        { role: "assistant", tool_calls: [{ id: "old", type: "function", function: { name: "edit", arguments: historicalArguments } }] },
+        { role: "tool", tool_call_id: "old", content: "old result" },
+        { role: "assistant", tool_calls: [{ id: "current", type: "function", function: { name: "write", arguments: currentArguments } }] },
+        { role: "tool", tool_call_id: "current", content: "current result" },
+      ],
+      tools: [{ type: "function", function: { name: "edit", description: "protected", parameters: { type: "object" } } }],
+    }
+    const result = await reduceRequestToBudget(request, budget, store)
+    const eviction = result.evictions.find((entry) => entry.reductionClass === "HISTORICAL_ARGUMENT")
+    assert.ok(eviction)
+    const oldCall = (result.request.messages[1]!.tool_calls as Array<{ id: string; type: string; function: { name: string; arguments: string } }>)[0]!
+    const currentCall = (result.request.messages[3]!.tool_calls as Array<{ id: string; function: { arguments: string } }>)[0]!
+    assert.equal(oldCall.id, "old")
+    assert.equal(oldCall.type, "function")
+    assert.equal(oldCall.function.name, "edit")
+    assert.doesNotThrow(() => JSON.parse(oldCall.function.arguments))
+    assert.match(oldCall.function.arguments, /ctx:\/\/sha256\//)
+    assert.equal(await store.get(eviction.handle), historicalArguments)
+    assert.equal(result.request.messages[2]!.tool_call_id, "old")
+    assert.equal(currentCall.function.arguments, currentArguments)
+    assert.equal(result.request.messages[4]!.tool_call_id, "current")
+    assert.deepEqual(result.request.tools, request.tools)
+    assert.equal(request.messages[1]!.tool_calls, request.messages[1]!.tool_calls)
+  })
+})
+
+test("archives a completed last tool round after a newer user request", async () => {
+  await withStore(async (store) => {
+    const argumentsValue = JSON.stringify({ patch: "P".repeat(4_000) })
+    const request: ChatCompletionRequest = {
+      messages: [
+        { role: "assistant", tool_calls: [{ id: "done", type: "function", function: { name: "edit", arguments: argumentsValue } }] },
+        { role: "tool", tool_call_id: "done", content: "done" },
+        { role: "user", content: "continue" },
+      ],
+    }
+    const result = await reduceRequestToBudget(request, budget, store)
+    const eviction = result.evictions.find((entry) => entry.reductionClass === "HISTORICAL_ARGUMENT")
+    assert.ok(eviction)
+    assert.equal(await store.get(eviction.handle), argumentsValue)
+  })
+})
+
+test("preserves unmatched and current parallel tool-call arguments", async () => {
+  await withStore(async (store) => {
+    const unmatched = JSON.stringify({ patch: "U".repeat(4_000) })
+    const matched = JSON.stringify({ patch: "M".repeat(4_000) })
+    const request: ChatCompletionRequest = {
+      messages: [
+        { role: "assistant", tool_calls: [
+          { id: "matched", type: "function", function: { name: "edit", arguments: matched } },
+          { id: "pending", type: "function", function: { name: "edit", arguments: unmatched } },
+        ] },
+        { role: "tool", tool_call_id: "matched", content: "done" },
+        { role: "user", content: "continue" },
+      ],
+    }
+    const constrained = createContextBudget({ effectiveContext: 1_000, outputReserve: 200, safetyReserve: 100 })
+    await assert.rejects(
+      reduceRequestToBudget(request, constrained, store),
+      (error: unknown) => error instanceof ContextBudgetExceededError
+        && (error.result.request.messages[0]!.tool_calls as Array<{ function: { arguments: string } }>)[0]!.function.arguments === matched
+        && (error.result.request.messages[0]!.tool_calls as Array<{ function: { arguments: string } }>)[1]!.function.arguments === unmatched
+        && error.result.evictions.every((entry) => entry.reductionClass !== "HISTORICAL_ARGUMENT"),
+    )
+  })
+})
+
+test("does not archive historical arguments to chase a governor target below safeInput", async () => {
+  await withStore(async (store) => {
+    const argumentsValue = JSON.stringify({ patch: "P".repeat(1_500) })
+    const request: ChatCompletionRequest = {
+      messages: [
+        { role: "assistant", tool_calls: [{ id: "old", type: "function", function: { name: "edit", arguments: argumentsValue } }] },
+        { role: "tool", tool_call_id: "old", content: "done" },
+        { role: "user", content: "continue" },
+      ],
+    }
+    const result = await reduceRequestToBudget(request, budget, store, { targetTokens: 10 })
+    assert.ok(result.afterTokens > 10)
+    assert.equal(result.evictions.some((entry) => entry.reductionClass === "HISTORICAL_ARGUMENT"), false)
+    const call = (result.request.messages[0]!.tool_calls as Array<{ function: { arguments: string } }>)[0]!
+    assert.equal(call.function.arguments, argumentsValue)
+  })
+})
+
+test("never accepts a LIVE_EVIDENCE candidate that increases authoritative tokens", async () => {
+  await withStore(async (store) => {
+    const original = "L".repeat(2_000)
+    const request: ChatCompletionRequest = {
+      messages: [
+        { role: "system", content: "protected" },
+        { role: "assistant", tool_calls: [{ id: "current", type: "function", function: { name: "read", arguments: "{}" } }] },
+        { role: "tool", tool_call_id: "current", content: original },
+      ],
+    }
+    const measureRequest = async (candidate: ChatCompletionRequest): Promise<{ tokens: number }> => {
+      const value = String(candidate.messages[2]!.content)
+      if (value === original) return { tokens: 900 }
+      if (value.includes("Preserved estimated tokens: 0")) return { tokens: 650 }
+      return { tokens: 950 }
+    }
+    const result = await reduceRequestToBudget(request, budget, store, { measureRequest, liveEvidenceSafetyMarginTokens: 0 })
+    assert.equal(result.beforeTokens, 900)
+    assert.equal(result.afterTokens, 650)
+    assert.match(String(result.request.messages[2]!.content), /Preserved estimated tokens: 0/)
+    assert.equal(result.evictions.length, 1)
+    assert.equal(result.evictions[0]?.reductionClass, "LIVE_EVIDENCE")
+  })
+})
+
+test("fails closed deterministically for the 325203-token hard-overflow class", async () => {
+  await withStore(async (store) => {
+    const request: ChatCompletionRequest = {
+      messages: [
+        { role: "system", content: "protected" },
+        { role: "assistant", tool_calls: [{ id: "old", type: "function", function: { name: "read", arguments: "{}" } }] },
+        { role: "tool", tool_call_id: "old", content: "old".repeat(100_000) },
+        { role: "assistant", tool_calls: [{ id: "current", type: "function", function: { name: "read", arguments: "{}" } }] },
+        { role: "tool", tool_call_id: "current", content: "tiny" },
+      ],
+    }
+    const measureRequest = async (candidate: ChatCompletionRequest): Promise<{ tokens: number }> => {
+      const oldArchived = String(candidate.messages[2]!.content).includes("ctx://")
+      const liveOriginal = candidate.messages[4]!.content === "tiny"
+      if (!oldArchived) return { tokens: 325_203 }
+      return { tokens: liveOriginal ? 19_216 : 19_272 }
+    }
+    const hardBudget = createContextBudget({ effectiveContext: 25_088, outputReserve: 4_096, safetyReserve: 2_048 })
+    await assert.rejects(
+      reduceRequestToBudget(request, hardBudget, store, { measureRequest, targetTokens: 8_524 }),
+      (error: unknown) => error instanceof ContextBudgetExceededError
+        && error.budget.safeInput === 18_944
+        && error.result.beforeTokens === 325_203
+        && error.result.afterTokens === 19_216
+        && error.result.evictions.length === 1
+        && error.result.evictions[0]?.reductionClass === "SAFE"
+        && error.result.request.messages[4]!.content === "tiny",
+    )
+  })
+})
+
 test("fails closed when deterministic tool eviction cannot satisfy the budget", async () => {
   await withStore(async (store) => {
     const request: ChatCompletionRequest = {
