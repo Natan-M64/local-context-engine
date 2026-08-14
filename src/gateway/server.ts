@@ -39,7 +39,13 @@ export interface RequestMetrics {
   tokenEstimatorMode?: TokenEstimatorMode
   measurement_source?: string
   measurement_confidence?: "exact" | "approximate"
+  initial_measurement_source?: string
+  initial_measurement_confidence?: "exact" | "approximate"
+  final_measurement_source?: string
+  final_measurement_confidence?: "exact" | "approximate"
   authoritative_input_tokens?: number
+  authoritative_input_tokens_before?: number
+  authoritative_input_tokens_after?: number
   static_tokens?: number
   runtime_tokens?: number
   estimator_delta?: number
@@ -57,7 +63,7 @@ export interface RequestMetrics {
   streamDoneMarkerSeen?: boolean
   streamFinishReasonSeen?: boolean
   clientAborted?: boolean
-  forwardingDecision: "forwarded" | "context_budget_exceeded" | "context_unknown" | "invalid_request" | "upstream_error"
+  forwardingDecision: "forwarded" | "context_budget_exceeded" | "context_unknown" | "invalid_request" | "upstream_error" | "token_measurement_unavailable"
 }
 
 function upstreamUrl(baseUrl: string, requestUrl = "/"): URL {
@@ -197,12 +203,16 @@ export function createGatewayServer(
         metrics.tokenEstimatorMode = providerMode
         metrics.estimatorConfidence = estimator.confidence
 
-        const measureRequest = async (req: ChatCompletionRequest): Promise<TokenMeasurement> => {
+        const discovered = await discoverRuntimeContext(config.upstreamBaseUrl, payload.model)
+
+        const getMeasurement = async (req: ChatCompletionRequest): Promise<TokenMeasurement | undefined> => {
           if (providerMode === "auto") {
-            try {
-              const measurement = await tokenMeasurementProvider.estimateChatRequest(req)
-              if (measurement !== undefined) return measurement
-            } catch {}
+            if (discovered?.runtimeKind === "lmstudio" || discovered?.runtimeKind === undefined) {
+              try {
+                const measurement = await tokenMeasurementProvider.estimateChatRequest(req)
+                if (measurement !== undefined) return measurement
+              } catch {}
+            }
           }
           return {
             tokens: estimateRequestTokens(req, estimator),
@@ -211,14 +221,34 @@ export function createGatewayServer(
           }
         }
 
-        const initialMeasurement = await measureRequest(payload)
+        const initialMeasurement = await getMeasurement(payload)
+        if (initialMeasurement === undefined) {
+          metrics.forwardingDecision = "token_measurement_unavailable"
+          json(response, 500, { error: { type: "token_measurement_unavailable", message: "Initial token measurement failed." } })
+          return
+        }
+
+        const requiredConfidence = initialMeasurement.confidence
+        let latestMeasurement = initialMeasurement
+
+        const measureRequest = async (req: ChatCompletionRequest): Promise<{ tokens: number; source: string; confidence: "exact" | "approximate" }> => {
+          const m = await getMeasurement(req)
+          if (m === undefined || m.confidence !== requiredConfidence) {
+            throw new Error("token_measurement_unavailable")
+          }
+          latestMeasurement = m
+          return m
+        }
+
         metrics.measurement_source = initialMeasurement.source
         metrics.measurement_confidence = initialMeasurement.confidence
+        metrics.initial_measurement_source = initialMeasurement.source
+        metrics.initial_measurement_confidence = initialMeasurement.confidence
         metrics.authoritative_input_tokens = initialMeasurement.tokens
+        metrics.authoritative_input_tokens_before = initialMeasurement.tokens
         metrics.requestTokensBefore = initialMeasurement.tokens
         metrics.token_breakdown_before = estimateTokenBreakdown(payload, estimator)
         metrics.live_evidence_tokens_before = metrics.token_breakdown_before.current_tool_results
-        const discovered = await discoverRuntimeContext(config.upstreamBaseUrl, payload.model)
 
         if (providerMode === "shadow") {
           const t0 = performance.now()
@@ -350,6 +380,9 @@ export function createGatewayServer(
         metrics.requestTokensBefore = reduced.beforeTokens
         metrics.requestTokensAfter = reduced.afterTokens
         metrics.authoritative_input_tokens = reduced.afterTokens
+        metrics.authoritative_input_tokens_after = reduced.afterTokens
+        metrics.final_measurement_source = latestMeasurement.source
+        metrics.final_measurement_confidence = latestMeasurement.confidence
         metrics.token_breakdown_after = estimateTokenBreakdown(reduced.request, estimator)
         recordLiveEvidenceMetrics(metrics, reduced, metrics.token_breakdown_after)
         metrics.reclaimedTokens = reduced.reclaimedTokens
@@ -426,6 +459,16 @@ export function createGatewayServer(
             safe_input: error.budget.safeInput,
             request_tokens: error.result.afterTokens,
             reclaimed_tokens: error.result.reclaimedTokens,
+          },
+        })
+        return
+      }
+      if (error instanceof Error && error.message === "token_measurement_unavailable") {
+        metrics.forwardingDecision = "token_measurement_unavailable"
+        json(response, 500, {
+          error: {
+            type: "token_measurement_unavailable",
+            message: "Exact token measurement became unavailable during reduction.",
           },
         })
         return

@@ -381,3 +381,51 @@ test("10. no request above authoritative safeInput reaches mock upstream", async
   await close(upstream)
   await rm(root, { recursive: true, force: true })
 })
+
+test("11. generic approximate request remains approximate throughout request", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "test-stabilization-11-"))
+  let upstreamCalled = false
+  const upstream = http.createServer((req, res) => {
+    if (req.url?.includes("/models")) {
+      res.writeHead(200, { "content-type": "application/json" })
+      res.end(JSON.stringify({ data: [{ id: "local", type: "llm" }] }))
+      return
+    }
+    upstreamCalled = true
+    res.writeHead(200, { "content-type": "application/json" })
+    res.end(JSON.stringify({ choices: [{ message: { role: "assistant", content: "ok" } }] }))
+  })
+  const upstreamPort = await listen(upstream)
+
+  const gateway = createGatewayServer({
+    host: "127.0.0.1",
+    port: 0,
+    upstreamBaseUrl: `http://127.0.0.1:${upstreamPort}/v1`,
+    contextWindow: 1000,
+    outputReserve: 100,
+    safetyReserve: 100,
+    storeRoot: root,
+    maxRequestBytes: 1_000_000,
+    tokenEstimatorMode: "static",
+  })
+  const gatewayPort = await listen(gateway)
+
+  const res = await fetch(`http://127.0.0.1:${gatewayPort}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: "local",
+      messages: [
+        { role: "system", content: "sys" },
+        { role: "user", content: "hello" },
+      ],
+    }),
+  })
+
+  assert.equal(res.status, 200)
+  assert.equal(upstreamCalled, true)
+
+  await close(gateway)
+  await close(upstream)
+  await rm(root, { recursive: true, force: true })
+})

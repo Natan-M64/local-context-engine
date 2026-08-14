@@ -1,6 +1,7 @@
 export interface RuntimeContext {
   effectiveContext: number
   source: "loaded"
+  runtimeKind: "lmstudio" | "generic"
 }
 
 interface RuntimeModel {
@@ -52,7 +53,7 @@ export class GenericOpenAIAdapter implements RuntimeAdapter {
       const response = await fetch(endpoint, { signal: AbortSignal.timeout(2_000) })
       if (!response.ok) return undefined
       const loadedContext = loadedContextFromModels(await response.json(), modelId)
-      return loadedContext === undefined ? undefined : { effectiveContext: loadedContext, source: "loaded" }
+      return loadedContext === undefined ? undefined : { effectiveContext: loadedContext, source: "loaded", runtimeKind: "generic" }
     } catch {
       return undefined
     }
@@ -68,7 +69,7 @@ export class LMStudioAdapter implements RuntimeAdapter {
         const response = await fetch(endpoint, { signal: AbortSignal.timeout(2_000) })
         if (!response.ok) continue
         const loadedContext = loadedContextFromModels(await response.json(), modelId)
-        if (loadedContext !== undefined) return { effectiveContext: loadedContext, source: "loaded" }
+        if (loadedContext !== undefined) return { effectiveContext: loadedContext, source: "loaded", runtimeKind: "lmstudio" }
       } catch {
         continue
       }
