@@ -83,7 +83,7 @@ loaded_context     = context physically loaded by the runtime, when discoverable
 configured_context = explicit conservative fallback
 effective_context  = loaded_context, otherwise configured_context, otherwise unavailable
 output_reserve     = requested output limit or configured default
-safety_reserve     = configured reserve or conservative estimator margin
+safety_reserve     = configured estimation uncertainty reserve or conservative margin
 safe_input         = effective_context - output_reserve - safety_reserve
 ```
 
@@ -103,7 +103,7 @@ The final estimate includes messages and tool definitions. An advertised or theo
 
 Token accounting is exposed through a replaceable `TokenMeasurementProvider` interface with explicit confidence levels (`exact` or `approximate`).
 
-In `CONTEXT_TOKEN_ESTIMATOR=auto` mode, when an exact provider such as `LMStudioTokenProvider` is active, its measurement is safety-authoritative for Measure, Budget, Evict (Fits), and Verify steps. When no exact provider is available or when set to `static`, the gateway falls back to `GenericConservativeProvider` (character-based estimation). In `shadow` mode, exact measurements are recorded in metrics while budgeting decisions use static character estimates.
+In `CONTEXT_TOKEN_ESTIMATOR=auto` mode, when an exact provider such as `LMStudioTokenProvider` is active, its measurement is authoritative for Measure, Budget, Evict (Fits), and Verify steps for that request. If exact measurement becomes unavailable during the same request, the gateway fails closed with `token_measurement_unavailable`; it does not downgrade to approximate. When no exact provider is selected or when set to `static`, the gateway uses `GenericConservativeProvider` (character-based estimation) as an approximate best-effort measurement. In `shadow` mode, exact measurements are recorded in metrics while budgeting decisions use static character estimates. The category breakdown remains heuristic and approximate.
 
 ## Deterministic reduction policy
 

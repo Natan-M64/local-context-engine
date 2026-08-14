@@ -34,7 +34,7 @@ Preserve system messages, the latest user request, current protocol continuity, 
 - Use Node.js 22+, TypeScript ESM, strict types, and built-in Node APIs where practical.
 - Keep modules small and policy-neutral. Prefer pure functions for measurement, budgeting, classification, and reduction.
 - Resolve the effective context from the runtime-loaded context first, then explicit configuration. Never use an advertised or theoretical model maximum as a permissive fallback.
-- Keep token estimation behind a replaceable `TokenMeasurementProvider` interface with explicit confidence (`exact` or `approximate`). When an exact provider is available, its measurement is authoritative; non-exact approximation uncertainty belongs in the safety reserve.
+- Keep token estimation behind a replaceable `TokenMeasurementProvider` interface with explicit confidence (`exact` or `approximate`). When an exact provider is available, its measurement is authoritative; non-exact approximation uncertainty belongs in the estimation uncertainty reserve.
 - Preserve tool-call/tool-result pairing, IDs, message order, and required protocol structure during reduction.
 - Preserve OpenAI-compatible request/response semantics, headers, cancellation, errors, and SSE byte order.
 - Do not mutate caller-owned request objects.

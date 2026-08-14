@@ -69,7 +69,7 @@ Metrics contain numeric request composition, governor decisions, reserves, budge
 
 `CONTEXT_TOKEN_ESTIMATOR=shadow` is validated as 100% observational: budget decisions, reducer measurements, and final verification remain controlled by `CharacterTokenEstimator`; the LM Studio runtime estimator contributes metrics only. The `LMStudioRuntimeEstimator` matched LM Studio's own `usage.prompt_tokens` exactly in controlled baseline, tool-results, post-`LIVE_EVIDENCE`, and assistant-history scenarios, including an actual `assistant.tool_calls[]` → `tool`/`tool_call_id` → `function.arguments` sequence with tool definitions. Observed runtime-estimator latency was approximately 21–73 ms.
 
-The `CharacterTokenEstimator` showed both overestimation and underestimation, and must not be treated as safety-authoritative for tool-heavy prompts. Promotion to `runtime` authority is explicitly deferred to the next phase; runtime authority is not enabled in this phase. Reducer, governor, CAS, `LIVE_EVIDENCE`, and pruning behavior remain unchanged.
+The `CharacterTokenEstimator` showed both overestimation and underestimation, and must not be treated as authoritative for tool-heavy prompts. Reducer, governor, CAS, `LIVE_EVIDENCE`, and pruning behavior remain unchanged.
 
 ## Controlled Kilo + LM Studio experiment
 

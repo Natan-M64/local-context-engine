@@ -53,6 +53,7 @@ export interface RequestMetrics {
   runtime_estimator_latency_ms?: number
   token_breakdown_before?: TokenBreakdown
   token_breakdown_after?: TokenBreakdown
+  token_breakdown_confidence?: "approximate"
   live_evidence_tokens_before?: number
   live_evidence_tokens_after?: number
   live_evidence_evictions?: number
@@ -211,7 +212,9 @@ export function createGatewayServer(
               try {
                 const measurement = await tokenMeasurementProvider.estimateChatRequest(req)
                 if (measurement !== undefined) return measurement
-              } catch {}
+              } catch (e) {
+                process.stderr.write(`Exact token measurement failed during auto resolution: ${e instanceof Error ? e.message : String(e)}\n`)
+              }
             }
           }
           return {
@@ -224,7 +227,7 @@ export function createGatewayServer(
         const initialMeasurement = await getMeasurement(payload)
         if (initialMeasurement === undefined) {
           metrics.forwardingDecision = "token_measurement_unavailable"
-          json(response, 500, { error: { type: "token_measurement_unavailable", message: "Initial token measurement failed." } })
+          json(response, 503, { error: { type: "token_measurement_unavailable", message: "Initial token measurement failed." } })
           return
         }
 
@@ -248,6 +251,7 @@ export function createGatewayServer(
         metrics.authoritative_input_tokens_before = initialMeasurement.tokens
         metrics.requestTokensBefore = initialMeasurement.tokens
         metrics.token_breakdown_before = estimateTokenBreakdown(payload, estimator)
+        metrics.token_breakdown_confidence = "approximate"
         metrics.live_evidence_tokens_before = metrics.token_breakdown_before.current_tool_results
 
         if (providerMode === "shadow") {
@@ -465,7 +469,7 @@ export function createGatewayServer(
       }
       if (error instanceof Error && error.message === "token_measurement_unavailable") {
         metrics.forwardingDecision = "token_measurement_unavailable"
-        json(response, 500, {
+        json(response, 503, {
           error: {
             type: "token_measurement_unavailable",
             message: "Exact token measurement became unavailable during reduction.",
