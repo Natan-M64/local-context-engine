@@ -19,6 +19,9 @@ test("configures JSONL metrics with opt-out capability and stable identity heade
   assert.equal(configFromEnvironment({}).governorMode, "govern")
   assert.equal(configFromEnvironment({ CONTEXT_GOVERNOR_MODE: "protect" }).governorMode, "protect")
   assert.throws(() => configFromEnvironment({ CONTEXT_GOVERNOR_MODE: "invalid" }), /protect or govern/)
+  assert.equal(configFromEnvironment({}).reasoningStreamMode, "passthrough")
+  assert.equal(configFromEnvironment({ CONTEXT_REASONING_STREAM: "strip" }).reasoningStreamMode, "strip")
+  assert.equal(configFromEnvironment({ CONTEXT_REASONING_STREAM: "invalid" }).reasoningStreamMode, "passthrough")
 })
 
 test("writes metadata-only request metrics as JSONL", async () => {

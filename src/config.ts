@@ -5,8 +5,11 @@ export type GovernorMode = "protect" | "govern"
 
 export type TokenEstimatorMode = "static" | "shadow" | "auto"
 
+export type ReasoningStreamMode = "passthrough" | "strip"
+
 export interface EngineConfig {
   tokenEstimatorMode?: TokenEstimatorMode
+  reasoningStreamMode?: ReasoningStreamMode
   host: string
   port: number
   upstreamBaseUrl: string
@@ -30,6 +33,7 @@ export function configFromEnvironment(environment: NodeJS.ProcessEnv = process.e
   const safetyReserve = positiveInteger(environment.CONTEXT_SAFETY_RESERVE)
   const governorMode = environment.CONTEXT_GOVERNOR_MODE ?? "govern"
   if (governorMode !== "protect" && governorMode !== "govern") throw new RangeError("CONTEXT_GOVERNOR_MODE must be protect or govern")
+  const reasoningStreamMode = environment.CONTEXT_REASONING_STREAM === "strip" ? "strip" : "passthrough"
   return {
     host: environment.CONTEXT_ENGINE_HOST ?? "127.0.0.1",
     port: positiveInteger(environment.CONTEXT_ENGINE_PORT) ?? 18_181,
@@ -46,6 +50,7 @@ export function configFromEnvironment(environment: NodeJS.ProcessEnv = process.e
         : { metricsJsonlPath: environment.CONTEXT_ENGINE_METRICS_JSONL }),
     ...(environment.CONTEXT_ENGINE_SESSION_HEADER === undefined ? {} : { sessionIdentityHeader: environment.CONTEXT_ENGINE_SESSION_HEADER }),
     governorMode,
+    reasoningStreamMode,
     ...(environment.CONTEXT_TOKEN_ESTIMATOR === "static" ||
     environment.CONTEXT_TOKEN_ESTIMATOR === "shadow" ||
     environment.CONTEXT_TOKEN_ESTIMATOR === "auto"

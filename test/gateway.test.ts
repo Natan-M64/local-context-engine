@@ -92,6 +92,7 @@ test("passes models through and reduces oversized chat requests before forwardin
 test("preserves streamed tool calls and records completion evidence", async () => {
   const metrics: RequestMetrics[] = []
   const events = [
+    'data: { "id": "x", "model": "qwen", "choices": [{"index":0,"delta":{"reasoning_content":"thinking"},"finish_reason":null}] }\n\n',
     'data: {"id":"x","choices":[{"index":0,"delta":{"content":"Vou analisar..."},"finish_reason":null}]}\n\n',
     'data: {"id":"x","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"read","arguments":"{\\"path\\""}}]},"finish_reason":null}]}\n\n',
     'data: {"id":"x","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":":\\"README.md\\"}"}}]},"finish_reason":null}]}\n\n',
@@ -137,6 +138,106 @@ test("preserves streamed tool calls and records completion evidence", async () =
     assert.equal(metrics[0]?.streamDoneMarkerSeen, true)
     assert.equal(metrics[0]?.streamFinishReasonSeen, true)
     assert.equal(metrics[0]?.clientAborted, undefined)
+  } finally {
+    await close(gateway)
+    await close(upstream)
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test("strips reasoning from streaming responses while preserving tool lifecycle", async () => {
+  const metrics: RequestMetrics[] = []
+  const events = [
+    'data: {"id":"x","model":"qwen","choices":[{"index":0,"delta":{"reasoning_content":"thinking"},"finish_reason":null}]}\n\n',
+    'data: {"id":"x","choices":[{"index":0,"delta":{"reasoning_content":"thinking","content":"answer"},"finish_reason":null}]}\n\n',
+    'data: {"id":"x","choices":[{"index":0,"delta":{"reasoning_content":"thinking","tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"read","arguments":"{}"}}]},"finish_reason":null}]}\n\n',
+    'data: {"id":"x","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"completion_tokens":4}}\n\n',
+    "data: [DONE]\n\n",
+  ]
+  const upstream = http.createServer(async (request, response) => {
+    if (request.url === "/api/v1/models" || request.url === "/v1/models") {
+      response.writeHead(200, { "content-type": "application/json" })
+      response.end(JSON.stringify({ data: [] }))
+      return
+    }
+    for await (const _chunk of request) void _chunk
+    response.writeHead(200, { "content-type": "text/event-stream" })
+    const bytes = Buffer.from(events.join(""))
+    for (let offset = 0; offset < bytes.length; offset += 7) response.write(bytes.subarray(offset, offset + 7))
+    response.end()
+  })
+  const root = await mkdtemp(path.join(os.tmpdir(), "local-context-engine-"))
+  const upstreamPort = await listen(upstream)
+  const gateway = createGatewayServer({
+    host: "127.0.0.1",
+    port: 0,
+    upstreamBaseUrl: `http://127.0.0.1:${upstreamPort}/v1`,
+    contextWindow: 10_000,
+    outputReserve: 500,
+    safetyReserve: 500,
+    storeRoot: root,
+    maxRequestBytes: 1_000_000,
+    reasoningStreamMode: "strip",
+  }, (entry) => metrics.push(entry))
+  const gatewayPort = await listen(gateway)
+  try {
+    const response = await fetch(`http://127.0.0.1:${gatewayPort}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "local", stream: true, messages: [{ role: "user", content: "inspect" }] }),
+    })
+    const output = await response.text()
+    assert.doesNotMatch(output, /reasoning_content/)
+    assert.match(output, /"content":"answer"/)
+    assert.match(output, /"id":"call_1"/)
+    assert.match(output, /"finish_reason":"tool_calls"/)
+    assert.match(output, /"usage":\{"completion_tokens":4\}/)
+    assert.ok(output.endsWith("data: [DONE]\n\n"))
+    assert.equal(metrics[0]?.streamReasoningSeen, true)
+    assert.equal(metrics[0]?.streamReasoningStripped, true)
+    assert.equal(metrics[0]?.streamReasoningChunksStripped, 3)
+    assert.equal(metrics[0]?.streamToolCallSeen, true)
+    assert.equal(metrics[0]?.streamFinishReason, "tool_calls")
+  } finally {
+    await close(gateway)
+    await close(upstream)
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test("does not strip reasoning from non-streaming responses", async () => {
+  const body = JSON.stringify({ choices: [{ message: { role: "assistant", reasoning_content: "thinking", content: "answer" } }] })
+  const upstream = http.createServer(async (request, response) => {
+    if (request.url === "/api/v1/models" || request.url === "/v1/models") {
+      response.writeHead(200, { "content-type": "application/json" })
+      response.end(JSON.stringify({ data: [] }))
+      return
+    }
+    for await (const _chunk of request) void _chunk
+    response.writeHead(200, { "content-type": "application/json" })
+    response.end(body)
+  })
+  const root = await mkdtemp(path.join(os.tmpdir(), "local-context-engine-"))
+  const upstreamPort = await listen(upstream)
+  const gateway = createGatewayServer({
+    host: "127.0.0.1",
+    port: 0,
+    upstreamBaseUrl: `http://127.0.0.1:${upstreamPort}/v1`,
+    contextWindow: 10_000,
+    outputReserve: 500,
+    safetyReserve: 500,
+    storeRoot: root,
+    maxRequestBytes: 1_000_000,
+    reasoningStreamMode: "strip",
+  })
+  const gatewayPort = await listen(gateway)
+  try {
+    const response = await fetch(`http://127.0.0.1:${gatewayPort}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "local", stream: false, messages: [{ role: "user", content: "inspect" }] }),
+    })
+    assert.equal(await response.text(), body)
   } finally {
     await close(gateway)
     await close(upstream)

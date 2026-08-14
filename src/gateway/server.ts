@@ -9,6 +9,7 @@ import { discoverRuntimeContext } from "../runtime/discovery.js"
 import type { ChatCompletionRequest } from "../types/openai.js"
 import { LMStudioTokenProvider, GenericConservativeProvider, createTokenMeasurementProvider, type TokenMeasurement } from "../context/providers/index.js"
 import type { EngineConfig, TokenEstimatorMode } from "../config.js"
+import { ReasoningSseStripper } from "./reasoning-stream.js"
 
 export interface RequestMetrics {
   requestTokensBefore?: number
@@ -58,11 +59,18 @@ export interface RequestMetrics {
   live_evidence_tokens_after?: number
   live_evidence_evictions?: number
   live_evidence_archived_tokens?: number
+  old_tool_argument_evictions?: number
+  old_tool_argument_archived_tokens?: number
   session_key_hash?: string
   session_identity_source?: SessionIdentitySource
   streamCompleted?: boolean
   streamDoneMarkerSeen?: boolean
   streamFinishReasonSeen?: boolean
+  streamReasoningSeen?: boolean
+  streamReasoningStripped?: boolean
+  streamReasoningChunksStripped?: number
+  streamToolCallSeen?: boolean
+  streamFinishReason?: string
   clientAborted?: boolean
   forwardingDecision: "forwarded" | "context_budget_exceeded" | "context_unknown" | "invalid_request" | "upstream_error" | "token_measurement_unavailable"
 }
@@ -141,16 +149,22 @@ interface ReductionResult {
   evictions: Array<{
     originalTokens: number
     retainedTokens: number
-    reductionClass: "SAFE" | "LIVE_EVIDENCE"
+    reductionClass: "SAFE" | "LIVE_EVIDENCE" | "HISTORICAL_ARGUMENT"
   }>
   fits: boolean
 }
 
-function recordLiveEvidenceMetrics(metrics: RequestMetrics, result: ReductionResult, afterBreakdown: TokenBreakdown): void {
+function recordEvictionMetrics(metrics: RequestMetrics, result: ReductionResult, afterBreakdown: TokenBreakdown): void {
   const liveEvictions = result.evictions.filter((eviction) => eviction.reductionClass === "LIVE_EVIDENCE")
+  const argumentEvictions = result.evictions.filter((eviction) => eviction.reductionClass === "HISTORICAL_ARGUMENT")
   metrics.live_evidence_tokens_after = afterBreakdown.current_tool_results
   metrics.live_evidence_evictions = liveEvictions.length
   metrics.live_evidence_archived_tokens = liveEvictions.reduce(
+    (sum, eviction) => sum + Math.max(0, eviction.originalTokens - eviction.retainedTokens),
+    0,
+  )
+  metrics.old_tool_argument_evictions = argumentEvictions.length
+  metrics.old_tool_argument_archived_tokens = argumentEvictions.reduce(
     (sum, eviction) => sum + Math.max(0, eviction.originalTokens - eviction.retainedTokens),
     0,
   )
@@ -192,8 +206,9 @@ export function createGatewayServer(
 
       const incomingBody = await readBody(request, config.maxRequestBytes)
       let outgoingBody: Buffer | undefined = incomingBody
+      let payload: ChatCompletionRequest | undefined
       if (incomingBody?.length && chatCompletion) {
-        const payload = JSON.parse(incomingBody.toString("utf8")) as ChatCompletionRequest
+        payload = JSON.parse(incomingBody.toString("utf8")) as ChatCompletionRequest
         if (!Array.isArray(payload.messages)) {
           metrics.forwardingDecision = "invalid_request"
           json(response, 400, { error: { type: "invalid_request", message: "messages must be an array" } })
@@ -335,8 +350,9 @@ export function createGatewayServer(
         metrics.session_identity_source = identity.source
         if (identity.sessionKeyHash !== undefined) metrics.session_key_hash = identity.sessionKeyHash
 
+        const chatPayload = payload
         const unchanged = (): ReductionResult => ({
-          request: payload,
+          request: chatPayload,
           beforeTokens: metrics.requestTokensBefore!,
           afterTokens: metrics.requestTokensBefore!,
           reclaimedTokens: 0,
@@ -346,7 +362,7 @@ export function createGatewayServer(
         const reduceForGoal = async (goal: ReductionGoal): Promise<ReductionResult> => {
           if (!goal.shouldReduce && metrics.requestTokensBefore! <= budget.safeInput) return unchanged()
           const targetTokens = goal.shouldReduce ? goal.targetTokens : budget.safeInput
-          return reduceRequestToBudget(payload, budget, store, { estimator, measureRequest, targetTokens })
+          return reduceRequestToBudget(chatPayload, budget, store, { estimator, measureRequest, targetTokens })
         }
 
         let reduced: ReductionResult
@@ -354,7 +370,7 @@ export function createGatewayServer(
           metrics.governorTriggered = false
           reduced = metrics.requestTokensBefore <= budget.safeInput
             ? unchanged()
-            : await reduceRequestToBudget(payload, budget, store, { estimator, measureRequest, targetTokens: budget.safeInput })
+            : await reduceRequestToBudget(chatPayload, budget, store, { estimator, measureRequest, targetTokens: budget.safeInput })
         } else if (identity.governorKey === undefined) {
           const statelessGovernor = new MultiSessionGovernor()
           const state = statelessGovernor.getOrCreateState("request")
@@ -388,7 +404,7 @@ export function createGatewayServer(
         metrics.final_measurement_source = latestMeasurement.source
         metrics.final_measurement_confidence = latestMeasurement.confidence
         metrics.token_breakdown_after = estimateTokenBreakdown(reduced.request, estimator)
-        recordLiveEvidenceMetrics(metrics, reduced, metrics.token_breakdown_after)
+        recordEvictionMetrics(metrics, reduced, metrics.token_breakdown_after)
         metrics.reclaimedTokens = reduced.reclaimedTokens
         metrics.numberOfEvictions = reduced.evictions.length
         metrics.forwardingDecision = "forwarded"
@@ -414,6 +430,11 @@ export function createGatewayServer(
       }
       const reader = upstream.body.getReader()
       const streaming = upstream.headers.get("content-type")?.includes("text/event-stream") ?? false
+      const stripReasoning = streaming
+        && chatCompletion
+        && payload?.stream === true
+        && config.reasoningStreamMode === "strip"
+      const reasoningStripper = stripReasoning ? new ReasoningSseStripper() : undefined
       let streamObservation = ""
       if (streaming) {
         metrics.streamCompleted = false
@@ -425,12 +446,26 @@ export function createGatewayServer(
           const chunk = await reader.read()
           if (chunk.done) break
           if (streaming) streamObservation = observeStreamChunk(metrics, streamObservation, chunk.value)
-          if (!response.write(Buffer.from(chunk.value))) {
+          const downstream = reasoningStripper === undefined ? Buffer.from(chunk.value) : Buffer.from(reasoningStripper.push(chunk.value))
+          if (downstream.length > 0 && !response.write(downstream)) {
+            await new Promise<void>((resolve) => response.once("drain", resolve))
+          }
+        }
+        if (reasoningStripper !== undefined) {
+          const finalChunk = Buffer.from(reasoningStripper.flush())
+          if (finalChunk.length > 0 && !response.write(finalChunk)) {
             await new Promise<void>((resolve) => response.once("drain", resolve))
           }
         }
         if (streaming) metrics.streamCompleted = true
       } finally {
+        if (reasoningStripper !== undefined) {
+          metrics.streamReasoningSeen = reasoningStripper.observation.reasoningSeen
+          metrics.streamReasoningStripped = reasoningStripper.observation.reasoningStripped
+          metrics.streamReasoningChunksStripped = reasoningStripper.observation.reasoningChunksStripped
+          metrics.streamToolCallSeen = reasoningStripper.observation.toolCallSeen
+          if (reasoningStripper.observation.finishReason !== undefined) metrics.streamFinishReason = reasoningStripper.observation.finishReason
+        }
         reader.releaseLock()
       }
       response.end()
@@ -440,7 +475,7 @@ export function createGatewayServer(
         metrics.requestTokensBefore = error.result.beforeTokens
         metrics.requestTokensAfter = error.result.afterTokens
         metrics.token_breakdown_after = estimateTokenBreakdown(error.result.request)
-        recordLiveEvidenceMetrics(metrics, error.result, metrics.token_breakdown_after)
+        recordEvictionMetrics(metrics, error.result, metrics.token_breakdown_after)
         metrics.reclaimedTokens = error.result.reclaimedTokens
         metrics.numberOfEvictions = error.result.evictions.length
         metrics.physicalContext = error.budget.effectiveContext
