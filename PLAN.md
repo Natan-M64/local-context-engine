@@ -129,6 +129,15 @@ Must preserve:
 
 Reduction may replace a tool result's content, but it must not remove only one side of a required pair, change its ID, or reorder the protocol sequence.
 
+Reduction classes are:
+
+- **SAFE:** old tool results and already archived deterministic payloads; eligible for automatic eviction;
+- **LIVE_EVIDENCE:** current or recently produced tool results required for continuity; excluded from preventive reduction and eligible for bounded CAS externalization only under hard overflow after SAFE is exhausted;
+- **CAUTIOUS:** old assistant narrative and progress; excluded from preventive and hard-overflow reduction in the current policy;
+- **PROTECTED:** system/developer messages, all user requirements, tool names, schemas and descriptions, current tool-call arguments, and protocol identifiers; never reduced automatically.
+
+`targetTokens` is a best-effort optimization objective applied only to SAFE content. `safeInput` is the hard forwarding boundary. Requests at or below `safeInput` pass through without LIVE_EVIDENCE reduction. Above `safeInput`, reduction proceeds through SAFE and then LIVE_EVIDENCE; existing CAUTIOUS policy may follow only if required. If those classes cannot bring the request within `safeInput`, the gateway fails closed.
+
 An evicted result becomes a bounded replacement:
 
 ```text
@@ -137,6 +146,19 @@ Handle: ctx://sha256/<hash>
 Original size: <bytes> (<estimated tokens> estimated tokens)
 Preview:
 <bounded head/tail preview>
+```
+
+LIVE_EVIDENCE uses a distinct hard-overflow representation whose head/tail excerpt is allocated dynamically from the remaining `safeInput` budget, newest evidence first:
+
+```text
+[Current tool output partially archived]
+Handle: ctx://sha256/<hash>
+Original estimated tokens: <n>
+Preserved estimated tokens: <n>
+
+--- BEGIN EXCERPT ---
+<bounded 50% head / 50% tail excerpt>
+--- END EXCERPT ---
 ```
 
 The full body is stored in a filesystem content-addressed store. Identical content deduplicates naturally. The stable handle is independent of the storage and retrieval implementation.
@@ -203,11 +225,15 @@ Emergency  90%
 
 All watermark percentages are relative to `safe_input`, never to the physical or effective context. Normal operation below rearm performs no reduction. Crossing high triggers enough eviction to return near target, not merely below high. The governor rearms only after meaningful growth, preventing repeated small reductions.
 
+The governor supports two experiment modes through `CONTEXT_GOVERNOR_MODE`: `protect` disables preventive reduction and applies SAFE-only eviction strictly above `safeInput`; `govern` enables watermarks and hysteresis while keeping preventive and hard-overflow reduction SAFE-only. This isolates proactive governor behavior without changing the hard-overflow policy.
+
 Additional controls:
 
 - minimum tokens reclaimed;
 - minimum growth before another reduction;
 - optional minimum turns between reductions when session identity is available;
+- session identity priority is explicit conversation/session ID, configured stable header, conservative conversation-prefix fingerprint, then stateless operation; request IDs and model/IP/user tuples are not persistent conversation identity;
+- inferred identity may improve hysteresis efficiency but is never required for hard budget enforcement, final verification, or fail-closed correctness;
 - no semantic compaction when projected deterministic gain is sufficient;
 - emergency reduction still obeys must-preserve rules.
 
@@ -255,6 +281,7 @@ This early v0.1 implementation passes typecheck, tests, and production compilati
 - [x] Re-measure before forwarding.
 - [x] Return `context_budget_exceeded` without upstream contact when reduction is insufficient.
 - [x] Emit structured metrics for input, reserves, estimator confidence, safe budget, reclaimed tokens, evictions, and forwarding decision.
+- [x] Emit metadata-only token attribution before and after reduction without recording request content.
 - [x] Support opt-in metadata-only JSONL metrics from the standalone CLI.
 
 ### v0.2 — Context governor

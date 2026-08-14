@@ -70,6 +70,8 @@ test("passes models through and reduces oversized chat requests before forwardin
           { role: "user", content: "inspect" },
           { role: "assistant", tool_calls: [{ id: "one", type: "function", function: { name: "read", arguments: "{}" } }] },
           { role: "tool", tool_call_id: "one", content: "X".repeat(3_200) },
+          { role: "assistant", tool_calls: [{ id: "two", type: "function", function: { name: "read", arguments: "{}" } }] },
+          { role: "tool", tool_call_id: "two", content: "current" },
         ],
       }),
     })
@@ -192,6 +194,72 @@ test("reduces the golden multi-read request below the safe input budget", async 
     const assistant = messages.find((message) => message.role === "assistant") as { tool_calls?: Array<{ id: string }> } | undefined
     const tool = messages.find((message) => message.tool_call_id === "sql")
     assert.equal(assistant?.tool_calls?.[0]?.id, tool?.tool_call_id)
+  } finally {
+    await close(gateway)
+    await close(upstream)
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test("uses the governor target to create headroom for continued agent steps", async () => {
+  let received: ChatCompletionRequest | undefined
+  const metrics: RequestMetrics[] = []
+  const upstream = http.createServer(async (request, response) => {
+    if (request.url === "/api/v1/models" || request.url === "/v1/models") {
+      response.writeHead(200, { "content-type": "application/json" })
+      response.end(JSON.stringify({ data: [{ id: "local", loaded_instances: [{ config: { context_length: 10_000 } }] }] }))
+      return
+    }
+    const chunks: Buffer[] = []
+    for await (const chunk of request) chunks.push(Buffer.from(chunk))
+    received = JSON.parse(Buffer.concat(chunks).toString("utf8")) as ChatCompletionRequest
+    response.writeHead(200, { "content-type": "application/json" })
+    response.end(JSON.stringify({ choices: [{ message: { role: "assistant", content: "continue" }, finish_reason: "stop" }] }))
+  })
+  const root = await mkdtemp(path.join(os.tmpdir(), "local-context-engine-target-"))
+  const upstreamPort = await listen(upstream)
+  const gateway = createGatewayServer({
+    host: "127.0.0.1",
+    port: 0,
+    upstreamBaseUrl: `http://127.0.0.1:${upstreamPort}/v1`,
+    contextWindow: 10_000,
+    outputReserve: 1_000,
+    safetyReserve: 1_000,
+    storeRoot: root,
+    maxRequestBytes: 1_000_000,
+  }, (entry) => metrics.push(entry))
+  const gatewayPort = await listen(gateway)
+  try {
+    const response = await fetch(`http://127.0.0.1:${gatewayPort}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-session-id": "long-agent-session" },
+      body: JSON.stringify({
+        model: "local",
+        messages: [
+          { role: "system", content: "system" },
+          { role: "user", content: "continue the investigation" },
+          ...Array.from({ length: 10 }, (_, index) => ({
+            role: "tool",
+            tool_call_id: `call_${index}`,
+            content: `evidence ${index} `.repeat(220),
+          })),
+          { role: "tool", tool_call_id: "recent", content: "recent protected evidence" },
+        ],
+      }),
+    })
+
+    assert.equal(response.status, 200)
+    assert.ok(received)
+    assert.equal(metrics[0]?.governorTriggered, true)
+    assert.equal(metrics[0]?.governorTargetTokens, 3_600)
+    assert.ok((metrics[0]?.numberOfEvictions ?? 0) > 0)
+    assert.ok(estimateRequestTokens(received!) <= 3_600)
+    assert.ok((metrics[0]?.requestTokensAfter ?? Infinity) <= 3_600)
+    assert.deepEqual(received!.messages.filter((message) => message.role !== "tool"), [
+      { role: "system", content: "system" },
+      { role: "user", content: "continue the investigation" },
+    ])
+    assert.equal(received!.messages.at(-1)?.content, "recent protected evidence")
   } finally {
     await close(gateway)
     await close(upstream)
@@ -417,16 +485,180 @@ test("recovers an overflow by shrinking archived previews as far as needed", asy
             tool_call_id: String(index),
             content: `EVIDENCE ${index} `.repeat(250),
           })),
+          { role: "user", content: "continue" },
         ],
       }),
     })
     assert.equal(response.status, 200)
     assert.equal(chatCalls, 1)
     assert.ok(received)
-    assert.ok(estimateRequestTokens(received!) <= 700)
-    const archived = received!.messages.slice(2).map((message) => String(message.content))
-    assert.ok(archived.every((content) => content.includes("[Tool output archived]")))
-    assert.ok(archived.some((content) => /Preview:\n$/.test(content)))
+    assert.ok(estimateRequestTokens(received!) <= 315)
+    const archived = received!.messages.filter((message) => message.role === "tool").map((message) => String(message.content))
+    assert.ok(archived.every((content) => content.includes("ctx://sha256/")))
+    assert.equal(received!.messages.at(-1)?.content, "continue")
+  } finally {
+    await close(gateway)
+    await close(upstream)
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test("protect mode forwards below safeInput without pruning and records requested output reserve", async () => {
+  let receivedBody = ""
+  const metrics: RequestMetrics[] = []
+  const upstream = http.createServer(async (request, response) => {
+    const chunks: Buffer[] = []
+    for await (const chunk of request) chunks.push(Buffer.from(chunk))
+    receivedBody = Buffer.concat(chunks).toString("utf8")
+    response.end("ok")
+  })
+  const root = await mkdtemp(path.join(os.tmpdir(), "local-context-engine-protect-pass-"))
+  const upstreamPort = await listen(upstream)
+  const gateway = createGatewayServer({
+    host: "127.0.0.1",
+    port: 0,
+    upstreamBaseUrl: `http://127.0.0.1:${upstreamPort}/v1`,
+    contextWindow: 25_088,
+    outputReserve: 4_096,
+    safetyReserve: 2_048,
+    storeRoot: root,
+    maxRequestBytes: 1_000_000,
+    governorMode: "protect",
+  }, (entry) => metrics.push(entry))
+  const gatewayPort = await listen(gateway)
+  const payload: ChatCompletionRequest = {
+    max_completion_tokens: 8_192,
+    messages: [{ role: "user", content: "small protected request" }],
+  }
+  try {
+    const response = await fetch(`http://127.0.0.1:${gatewayPort}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload),
+    })
+    assert.equal(response.status, 200)
+    assert.equal(receivedBody, JSON.stringify(payload))
+    assert.equal(metrics[0]?.governorMode, "protect")
+    assert.equal(metrics[0]?.governorTriggered, false)
+    assert.equal(metrics[0]?.numberOfEvictions, 0)
+    assert.equal(metrics[0]?.physical_context, 25_088)
+    assert.equal(metrics[0]?.effective_context, 25_088)
+    assert.equal(metrics[0]?.requestedOutputTokens, 8_192)
+    assert.equal(metrics[0]?.requested_output_tokens, 8_192)
+    assert.equal(metrics[0]?.outputReserveEffective, 8_192)
+    assert.equal(metrics[0]?.output_reserve_effective, 8_192)
+    assert.equal(metrics[0]?.safety_reserve, 2_048)
+    assert.equal(metrics[0]?.safeInput, 14_848)
+    assert.equal(metrics[0]?.safe_input, 14_848)
+    assert.deepEqual(metrics[0]?.token_breakdown_before, metrics[0]?.token_breakdown_after)
+  } finally {
+    await close(gateway)
+    await close(upstream)
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test("protect mode above safeInput evicts only SAFE old tool results", async () => {
+  let received: ChatCompletionRequest | undefined
+  const upstream = http.createServer(async (request, response) => {
+    if (request.url === "/api/v1/models" || request.url === "/v1/models") {
+      response.writeHead(200, { "content-type": "application/json" })
+      response.end(JSON.stringify({ data: [] }))
+      return
+    }
+    const chunks: Buffer[] = []
+    for await (const chunk of request) chunks.push(Buffer.from(chunk))
+    received = JSON.parse(Buffer.concat(chunks).toString("utf8")) as ChatCompletionRequest
+    response.end("ok")
+  })
+  const root = await mkdtemp(path.join(os.tmpdir(), "local-context-engine-protect-evict-"))
+  const upstreamPort = await listen(upstream)
+  const gateway = createGatewayServer({
+    host: "127.0.0.1",
+    port: 0,
+    upstreamBaseUrl: `http://127.0.0.1:${upstreamPort}/v1`,
+    contextWindow: 2_000,
+    outputReserve: 200,
+    safetyReserve: 100,
+    storeRoot: root,
+    maxRequestBytes: 1_000_000,
+    governorMode: "protect",
+  })
+  const gatewayPort = await listen(gateway)
+  const description = "protected tool guidance"
+  try {
+    const response = await fetch(`http://127.0.0.1:${gatewayPort}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        messages: [
+          { role: "user", content: "requirement" },
+          { role: "tool", tool_call_id: "old", content: "X".repeat(8_000) },
+          { role: "user", content: "continue" },
+        ],
+        tools: [{ type: "function", function: { name: "read", description } }],
+      }),
+    })
+    assert.equal(response.status, 200)
+    assert.ok(received)
+    assert.match(String(received!.messages[1]!.content), /ctx:\/\/sha256\//)
+    assert.equal((received!.tools![0] as { function: { description: string } }).function.description, description)
+  } finally {
+    await close(gateway)
+    await close(upstream)
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test("records metadata-only LIVE_EVIDENCE reduction metrics", async () => {
+  let received: ChatCompletionRequest | undefined
+  const metrics: RequestMetrics[] = []
+  const upstream = http.createServer(async (request, response) => {
+    if (request.url === "/api/v1/models" || request.url === "/v1/models") {
+      response.writeHead(200, { "content-type": "application/json" })
+      response.end(JSON.stringify({ data: [] }))
+      return
+    }
+    const chunks: Buffer[] = []
+    for await (const chunk of request) chunks.push(Buffer.from(chunk))
+    received = JSON.parse(Buffer.concat(chunks).toString("utf8")) as ChatCompletionRequest
+    response.end("ok")
+  })
+  const root = await mkdtemp(path.join(os.tmpdir(), "local-context-engine-live-metrics-"))
+  const upstreamPort = await listen(upstream)
+  const gateway = createGatewayServer({
+    host: "127.0.0.1",
+    port: 0,
+    upstreamBaseUrl: `http://127.0.0.1:${upstreamPort}/v1`,
+    contextWindow: 3_000,
+    outputReserve: 400,
+    safetyReserve: 200,
+    storeRoot: root,
+    maxRequestBytes: 1_000_000,
+    governorMode: "protect",
+  }, (entry) => metrics.push(entry))
+  const gatewayPort = await listen(gateway)
+  const currentOutput = "LIVE_EVIDENCE ".repeat(1_000)
+  try {
+    const response = await fetch(`http://127.0.0.1:${gatewayPort}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        messages: [
+          { role: "system", content: "system" },
+          { role: "user", content: "inspect" },
+          { role: "assistant", tool_calls: [{ id: "call_live", type: "function", function: { name: "read", arguments: "{}" } }] },
+          { role: "tool", name: "read", tool_call_id: "call_live", content: currentOutput },
+        ],
+      }),
+    })
+    assert.equal(response.status, 200)
+    assert.ok(received)
+    assert.match(String(received!.messages[3]!.content), /Current tool output partially archived/)
+    assert.ok((metrics[0]?.live_evidence_tokens_before ?? 0) > (metrics[0]?.live_evidence_tokens_after ?? Infinity))
+    assert.equal(metrics[0]?.live_evidence_evictions, 1)
+    assert.ok((metrics[0]?.live_evidence_archived_tokens ?? 0) > 0)
+    assert.equal(JSON.stringify(metrics[0]).includes(currentOutput), false)
   } finally {
     await close(gateway)
     await close(upstream)

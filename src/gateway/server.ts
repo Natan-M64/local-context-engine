@@ -1,7 +1,9 @@
 import http, { type IncomingHttpHeaders, type Server } from "node:http"
 import { createContextBudget } from "../context/budget.js"
-import { CharacterTokenEstimator, estimateRequestTokens, type EstimatorConfidence } from "../context/measure.js"
+import { CharacterTokenEstimator, estimateRequestTokens, estimateTokenBreakdown, type EstimatorConfidence, type TokenBreakdown } from "../context/measure.js"
 import { ContextBudgetExceededError, reduceRequestToBudget } from "../context/reduce.js"
+import { MultiSessionGovernor, type ReductionGoal } from "../context/governor.js"
+import { resolveSessionIdentity, type SessionIdentitySource } from "../context/session-identity.js"
 import { FilesystemContentStore } from "../eviction/store.js"
 import { discoverRuntimeContext } from "../runtime/discovery.js"
 import type { ChatCompletionRequest } from "../types/openai.js"
@@ -11,14 +13,36 @@ export interface RequestMetrics {
   requestTokensBefore?: number
   requestTokensAfter?: number
   safeInput?: number
+  physical_context?: number
+  effective_context?: number
+  requested_output_tokens?: number
+  output_reserve_effective?: number
+  safety_reserve?: number
+  safe_input?: number
   reclaimedTokens?: number
   numberOfEvictions?: number
   physicalContext?: number
   effectiveContext?: number
   contextSource?: "loaded" | "configured"
+  requestedOutputTokens?: number
+  outputReserveEffective?: number
   outputReserve?: number
   safetyReserve?: number
   estimatorConfidence?: EstimatorConfidence
+  governorTriggered?: boolean
+  governorEmergency?: boolean
+  governorArmedBefore?: boolean
+  governorArmedAfter?: boolean
+  governorTargetTokens?: number
+  governorMode?: "protect" | "govern"
+  token_breakdown_before?: TokenBreakdown
+  token_breakdown_after?: TokenBreakdown
+  live_evidence_tokens_before?: number
+  live_evidence_tokens_after?: number
+  live_evidence_evictions?: number
+  live_evidence_archived_tokens?: number
+  session_key_hash?: string
+  session_identity_source?: SessionIdentitySource
   streamCompleted?: boolean
   streamDoneMarkerSeen?: boolean
   streamFinishReasonSeen?: boolean
@@ -72,9 +96,13 @@ function configuredSafetyReserve(contextWindow: number, configured?: number): nu
   return configured ?? Math.max(2_048, Math.ceil(contextWindow * 0.08))
 }
 
-function outputReserve(payload: ChatCompletionRequest, configured: number): number {
+function requestedOutputTokens(payload: ChatCompletionRequest): number | undefined {
   const requested = Number(payload.max_completion_tokens ?? payload.max_tokens)
-  return Number.isFinite(requested) && requested > 0 ? Math.floor(requested) : configured
+  return Number.isFinite(requested) && requested > 0 ? Math.floor(requested) : undefined
+}
+
+function outputReserve(payload: ChatCompletionRequest, configured: number): number {
+  return requestedOutputTokens(payload) ?? configured
 }
 
 function isChatCompletion(request: http.IncomingMessage): boolean {
@@ -88,11 +116,35 @@ function observeStreamChunk(metrics: RequestMetrics, previous: string, chunk: Ui
   return text.slice(-128)
 }
 
+interface ReductionResult {
+  request: ChatCompletionRequest
+  beforeTokens: number
+  afterTokens: number
+  reclaimedTokens: number
+  evictions: Array<{
+    originalTokens: number
+    retainedTokens: number
+    reductionClass: "SAFE" | "LIVE_EVIDENCE"
+  }>
+  fits: boolean
+}
+
+function recordLiveEvidenceMetrics(metrics: RequestMetrics, result: ReductionResult, afterBreakdown: TokenBreakdown): void {
+  const liveEvictions = result.evictions.filter((eviction) => eviction.reductionClass === "LIVE_EVIDENCE")
+  metrics.live_evidence_tokens_after = afterBreakdown.current_tool_results
+  metrics.live_evidence_evictions = liveEvictions.length
+  metrics.live_evidence_archived_tokens = liveEvictions.reduce(
+    (sum, eviction) => sum + Math.max(0, eviction.originalTokens - eviction.retainedTokens),
+    0,
+  )
+}
+
 export function createGatewayServer(
   config: EngineConfig,
   metricsSink: (metrics: RequestMetrics) => void = () => undefined,
 ): Server {
   const store = new FilesystemContentStore(config.storeRoot)
+  const governor = new MultiSessionGovernor()
   return http.createServer(async (request, response) => {
     const controller = new AbortController()
     const chatCompletion = isChatCompletion(request)
@@ -126,6 +178,8 @@ export function createGatewayServer(
         const estimator = new CharacterTokenEstimator()
         metrics.estimatorConfidence = estimator.confidence
         metrics.requestTokensBefore = estimateRequestTokens(payload, estimator)
+        metrics.token_breakdown_before = estimateTokenBreakdown(payload, estimator)
+        metrics.live_evidence_tokens_before = metrics.token_breakdown_before.current_tool_results
         const discovered = await discoverRuntimeContext(config.upstreamBaseUrl, payload.model)
         const effectiveContext = discovered?.effectiveContext ?? config.contextWindow
         const contextSource = discovered ? "loaded" : config.contextWindow === undefined ? undefined : "configured"
@@ -139,16 +193,28 @@ export function createGatewayServer(
           })
           return
         }
+        const requestedOutput = requestedOutputTokens(payload)
         const requestedOutputReserve = outputReserve(payload, config.outputReserve)
         const requestedSafetyReserve = configuredSafetyReserve(effectiveContext, config.safetyReserve)
         metrics.physicalContext = effectiveContext
         metrics.effectiveContext = effectiveContext
+        metrics.physical_context = effectiveContext
+        metrics.effective_context = effectiveContext
         metrics.contextSource = contextSource
+        if (requestedOutput !== undefined) {
+          metrics.requestedOutputTokens = requestedOutput
+          metrics.requested_output_tokens = requestedOutput
+        }
+        metrics.outputReserveEffective = requestedOutputReserve
+        metrics.output_reserve_effective = requestedOutputReserve
         metrics.outputReserve = requestedOutputReserve
         metrics.safetyReserve = requestedSafetyReserve
+        metrics.safety_reserve = requestedSafetyReserve
+        metrics.governorMode = config.governorMode ?? "govern"
         const safeInput = effectiveContext - requestedOutputReserve - requestedSafetyReserve
         if (safeInput <= 0) {
           metrics.safeInput = 0
+          metrics.safe_input = 0
           metrics.forwardingDecision = "context_budget_exceeded"
           json(response, 400, {
             error: {
@@ -169,12 +235,67 @@ export function createGatewayServer(
           safetyReserve: requestedSafetyReserve,
         })
         metrics.safeInput = budget.safeInput
-        const reduced = await reduceRequestToBudget(payload, budget, store, { estimator })
+        metrics.safe_input = budget.safeInput
+
+        const identity = resolveSessionIdentity({
+          headers: request.headers,
+          payload,
+          ...(request.socket.remoteAddress === undefined ? {} : { remoteAddress: request.socket.remoteAddress }),
+          ...(config.sessionIdentityHeader === undefined ? {} : { configuredHeader: config.sessionIdentityHeader }),
+        })
+        metrics.session_identity_source = identity.source
+        if (identity.sessionKeyHash !== undefined) metrics.session_key_hash = identity.sessionKeyHash
+
+        const unchanged = (): ReductionResult => ({
+          request: payload,
+          beforeTokens: metrics.requestTokensBefore!,
+          afterTokens: metrics.requestTokensBefore!,
+          reclaimedTokens: 0,
+          evictions: [],
+          fits: true,
+        })
+        const reduceForGoal = async (goal: ReductionGoal): Promise<ReductionResult> => {
+          if (!goal.shouldReduce && metrics.requestTokensBefore! <= budget.safeInput) return unchanged()
+          const targetTokens = goal.shouldReduce ? goal.targetTokens : budget.safeInput
+          return reduceRequestToBudget(payload, budget, store, { estimator, targetTokens })
+        }
+
+        let reduced: ReductionResult
+        if ((config.governorMode ?? "govern") === "protect") {
+          metrics.governorTriggered = false
+          reduced = metrics.requestTokensBefore <= budget.safeInput
+            ? unchanged()
+            : await reduceRequestToBudget(payload, budget, store, { estimator, targetTokens: budget.safeInput })
+        } else if (identity.governorKey === undefined) {
+          const statelessGovernor = new MultiSessionGovernor()
+          const state = statelessGovernor.getOrCreateState("request")
+          metrics.governorArmedBefore = state.armed
+          const goal = statelessGovernor.evaluate("request", metrics.requestTokensBefore, budget)
+          metrics.governorTriggered = goal.shouldReduce
+          metrics.governorEmergency = goal.isEmergency
+          metrics.governorTargetTokens = goal.targetTokens
+          reduced = await reduceForGoal(goal)
+          if (reduced.evictions.length > 0) statelessGovernor.updateAfterReduction("request", reduced.beforeTokens, reduced.afterTokens)
+          metrics.governorArmedAfter = state.armed
+        } else {
+          reduced = await governor.runExclusive(identity.governorKey, metrics.requestTokensBefore, budget, async ({ goal, armedBefore, updateAfterReduction }) => {
+            metrics.governorArmedBefore = armedBefore
+            metrics.governorTriggered = goal.shouldReduce
+            metrics.governorEmergency = goal.isEmergency
+            metrics.governorTargetTokens = goal.targetTokens
+            const result = await reduceForGoal(goal)
+            if (result.evictions.length > 0) updateAfterReduction(result.beforeTokens, result.afterTokens)
+            metrics.governorArmedAfter = governor.getOrCreateState(identity.governorKey!).armed
+            return result
+          })
+        }
         outgoingBody = reduced.evictions.length === 0
           ? incomingBody
           : Buffer.from(JSON.stringify(reduced.request))
         metrics.requestTokensBefore = reduced.beforeTokens
         metrics.requestTokensAfter = reduced.afterTokens
+        metrics.token_breakdown_after = estimateTokenBreakdown(reduced.request, estimator)
+        recordLiveEvidenceMetrics(metrics, reduced, metrics.token_breakdown_after)
         metrics.reclaimedTokens = reduced.reclaimedTokens
         metrics.numberOfEvictions = reduced.evictions.length
         metrics.forwardingDecision = "forwarded"
@@ -225,13 +346,21 @@ export function createGatewayServer(
       if (error instanceof ContextBudgetExceededError) {
         metrics.requestTokensBefore = error.result.beforeTokens
         metrics.requestTokensAfter = error.result.afterTokens
+        metrics.token_breakdown_after = estimateTokenBreakdown(error.result.request)
+        recordLiveEvidenceMetrics(metrics, error.result, metrics.token_breakdown_after)
         metrics.reclaimedTokens = error.result.reclaimedTokens
         metrics.numberOfEvictions = error.result.evictions.length
         metrics.physicalContext = error.budget.effectiveContext
         metrics.effectiveContext = error.budget.effectiveContext
+        metrics.physical_context = error.budget.effectiveContext
+        metrics.effective_context = error.budget.effectiveContext
+        metrics.outputReserveEffective = error.budget.outputReserve
+        metrics.output_reserve_effective = error.budget.outputReserve
         metrics.outputReserve = error.budget.outputReserve
         metrics.safetyReserve = error.budget.safetyReserve
+        metrics.safety_reserve = error.budget.safetyReserve
         metrics.safeInput = error.budget.safeInput
+        metrics.safe_input = error.budget.safeInput
         metrics.forwardingDecision = "context_budget_exceeded"
         json(response, 400, {
           error: {

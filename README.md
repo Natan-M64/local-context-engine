@@ -31,6 +31,7 @@ npm run build
 
 ```bash
 CONTEXT_ENGINE_UPSTREAM_URL=http://127.0.0.1:1234/v1 \
+CONTEXT_GOVERNOR_MODE=govern \
 CONTEXT_OUTPUT_RESERVE=4096 \
 CONTEXT_SAFETY_RESERVE=2048 \
 node dist/src/cli.js
@@ -69,11 +70,46 @@ The gateway currently has no authentication or TLS. Expose it only on a trusted 
 | `CONTEXT_ENGINE_PORT` | `18181` | Gateway port |
 | `CONTEXT_ENGINE_UPSTREAM_URL` | `http://127.0.0.1:1234/v1` | OpenAI-compatible upstream base URL |
 | `CONTEXT_WINDOW_TOKENS` | unset | Conservative fallback when loaded context discovery fails |
-| `CONTEXT_OUTPUT_RESERVE` | `4096` | Default output-token reserve |
+| `CONTEXT_GOVERNOR_MODE` | `govern` | `protect` disables preventive eviction; `govern` enables SAFE-only watermarks |
+| `CONTEXT_OUTPUT_RESERVE` | `4096` | Default output-token reserve; a valid client `max_completion_tokens` or `max_tokens` takes precedence |
 | `CONTEXT_SAFETY_RESERVE` | 8% of context, minimum `2048` | Estimation uncertainty reserve |
 | `CONTEXT_ENGINE_STORE` | `~/.local-context-engine/store` | Content-addressed archive directory |
 | `CONTEXT_ENGINE_MAX_REQUEST_BYTES` | `16777216` | Maximum request body size |
-| `CONTEXT_ENGINE_METRICS_JSONL` | unset | Optional metadata-only request metrics file |
+| `CONTEXT_ENGINE_METRICS_JSONL` | `~/.local-context-engine/metrics.jsonl` | Metadata-only request metrics file; set `false` or empty to disable |
+
+Metrics contain numeric request composition, governor decisions, reserves, budgets, eviction counts, forwarding outcomes, and hashed session identity. They do not contain message, tool, argument, or result content.
+
+## Controlled Kilo + LM Studio experiment
+
+Build once, load the same model in LM Studio with `physical_context=25088`, and point the same Kilo OpenAI-compatible provider configuration at `http://127.0.0.1:18181/v1`. Keep model, prompt, tools, Kilo configuration, and client output fields identical between runs. Start a fresh Kilo session for each run and repeat the exact task from `session-ses_fffe2`.
+
+Test A:
+
+```bash
+CONTEXT_ENGINE_UPSTREAM_URL=http://127.0.0.1:1234/v1 \
+CONTEXT_WINDOW_TOKENS=25088 \
+CONTEXT_GOVERNOR_MODE=protect \
+CONTEXT_OUTPUT_RESERVE=8192 \
+CONTEXT_SAFETY_RESERVE=2048 \
+CONTEXT_ENGINE_METRICS_JSONL="$PWD/metrics-protect-8192.jsonl" \
+node dist/src/cli.js
+```
+
+Test B, after stopping Test A:
+
+```bash
+CONTEXT_ENGINE_UPSTREAM_URL=http://127.0.0.1:1234/v1 \
+CONTEXT_WINDOW_TOKENS=25088 \
+CONTEXT_GOVERNOR_MODE=govern \
+CONTEXT_OUTPUT_RESERVE=8192 \
+CONTEXT_SAFETY_RESERVE=2048 \
+CONTEXT_ENGINE_METRICS_JSONL="$PWD/metrics-govern-8192.jsonl" \
+node dist/src/cli.js
+```
+
+If Kilo sends `max_completion_tokens` or `max_tokens`, that value becomes `output_reserve_effective`; keep it identical in both runs. The configured `8192` is used only when neither field is valid. Save both fresh transcripts with their corresponding JSONL files.
+
+Only after this initial A/B, run the separate reserve axis with the selected governor mode held constant. For run A, preserve the client's current effective output field and record its resulting `output_reserve_effective`; for run B, set the same client's `max_tokens=4096`. Use fresh sessions and distinct JSONL paths, and do not compare outcomes until both transcripts and metrics are saved. With `physical_context=25088` and `safety_reserve=2048`, run B has `safe_input=18944`; run A must use the value recorded from the actual request rather than an environment default overridden by the client.
 
 ## Health check
 

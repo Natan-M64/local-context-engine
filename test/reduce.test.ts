@@ -62,6 +62,7 @@ test("shrinks archived previews when the first eviction pass narrowly misses the
         { role: "system", content: "S".repeat(1_300) },
         { role: "user", content: "preserve this request" },
         { role: "tool", tool_call_id: "old", content: oldOutput },
+        { role: "user", content: "continue" },
       ],
     }
     await assert.rejects(
@@ -97,6 +98,7 @@ test("removes archived previews when minimum previews still exceed the budget", 
         { role: "system", content: "system" },
         { role: "user", content: "preserve this request" },
         ...outputs.map((content, index) => ({ role: "tool" as const, tool_call_id: String(index), content })),
+        { role: "user", content: "continue" },
       ],
     }
     await assert.rejects(
@@ -131,12 +133,13 @@ test("compacts archive metadata when empty previews narrowly miss the budget", a
         { role: "system", content: "S".repeat(2_500) },
         { role: "user", content: "preserve this request" },
         { role: "tool", tool_call_id: "old", content: oldOutput },
+        { role: "user", content: "continue" },
       ],
     }
     const result = await reduceRequestToBudget(request, budget, store)
     assert.equal(result.fits, true)
     assert.equal(result.evictions.length, 1)
-    assert.equal(result.request.messages[2]!.content, result.evictions[0]!.handle)
+    assert.equal(result.request.messages[2]!.content, `[Content archived]\nHandle: ${result.evictions[0]!.handle}`)
     assert.equal(await store.get(result.evictions[0]!.handle), oldOutput)
     assert.deepEqual(request.messages[2]!.content, oldOutput)
   })
@@ -150,6 +153,7 @@ test("uses only the archive handle when the compact marker still exceeds the bud
         { role: "system", content: "S".repeat(56_600) },
         { role: "user", content: "preserve this request" },
         ...outputs.map((content, index) => ({ role: "tool" as const, tool_call_id: String(index), content })),
+        { role: "user", content: "continue" },
       ],
     }
     const result = await reduceRequestToBudget(request, createContextBudget({ effectiveContext: 25_088, outputReserve: 4_096, safetyReserve: 6_144 }), store)
@@ -159,10 +163,66 @@ test("uses only the archive handle when the compact marker still exceeds the bud
     for (const [index, eviction] of result.evictions.entries()) {
       const content = result.request.messages[index + 2]!.content
       assert.equal(typeof content, "string")
-      if (content === eviction.handle) handleOnlyCount += 1
+      if (content === `[Content archived]\nHandle: ${eviction.handle}`) handleOnlyCount += 1
       assert.equal(await store.get(eviction.handle), outputs[index])
     }
     assert.ok(handleOnlyCount > 0)
+  })
+})
+
+test("archives LIVE_EVIDENCE only under hard overflow with a dynamic bounded excerpt", async () => {
+  await withStore(async (store) => {
+    const currentOutput = `${"HEAD_EVIDENCE ".repeat(1_200)}${"TAIL_EVIDENCE ".repeat(1_200)}`
+    const request: ChatCompletionRequest = {
+      messages: [
+        { role: "system", content: "S".repeat(2_000) },
+        { role: "user", content: "inspect the current evidence" },
+        {
+          role: "assistant",
+          content: "reading",
+          tool_calls: [{ id: "call_current", type: "function", function: { name: "read", arguments: "{\"path\":\"evidence.log\"}" } }],
+        },
+        { role: "tool", name: "read", tool_call_id: "call_current", content: currentOutput },
+      ],
+    }
+    const liveBudget = createContextBudget({ effectiveContext: 3_000, outputReserve: 400, safetyReserve: 200 })
+    const result = await reduceRequestToBudget(request, liveBudget, store, { targetTokens: 100 })
+    const eviction = result.evictions.find((entry) => entry.reductionClass === "LIVE_EVIDENCE")
+    assert.ok(eviction)
+    assert.equal(result.fits, true)
+    assert.ok(result.afterTokens <= liveBudget.safeInput)
+    assert.equal(await store.get(eviction.handle), currentOutput)
+    assert.deepEqual(result.request.messages[2]!.tool_calls, request.messages[2]!.tool_calls)
+    assert.equal(result.request.messages[3]!.role, "tool")
+    assert.equal(result.request.messages[3]!.name, "read")
+    assert.equal(result.request.messages[3]!.tool_call_id, "call_current")
+    const archived = String(result.request.messages[3]!.content)
+    assert.match(archived, /^\[Current tool output partially archived\]/)
+    assert.match(archived, /Handle: ctx:\/\/sha256\/[a-f0-9]{64}/)
+    assert.match(archived, /Original estimated tokens: \d+/)
+    assert.match(archived, /Preserved estimated tokens: \d+/)
+    assert.match(archived, /--- BEGIN EXCERPT ---[\s\S]*HEAD_EVIDENCE/)
+    assert.match(archived, /TAIL_EVIDENCE[\s\S]*--- END EXCERPT ---/)
+    assert.notEqual(archived, eviction.handle)
+    assert.equal(request.messages[3]!.content, currentOutput)
+  })
+})
+
+test("does not archive LIVE_EVIDENCE to chase targetTokens below safeInput", async () => {
+  await withStore(async (store) => {
+    const currentOutput = "CURRENT ".repeat(150)
+    const request: ChatCompletionRequest = {
+      messages: [
+        { role: "user", content: "inspect" },
+        { role: "assistant", tool_calls: [{ id: "call_current", type: "function", function: { name: "read", arguments: "{}" } }] },
+        { role: "tool", tool_call_id: "call_current", content: currentOutput },
+      ],
+    }
+    const result = await reduceRequestToBudget(request, budget, store, { targetTokens: 10 })
+    assert.equal(result.fits, true)
+    assert.ok(result.afterTokens > 10)
+    assert.equal(result.evictions.length, 0)
+    assert.deepEqual(result.request, request)
   })
 })
 
