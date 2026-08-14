@@ -75,9 +75,16 @@ The gateway currently has no authentication or TLS. Expose it only on a trusted 
 | `CONTEXT_SAFETY_RESERVE` | 8% of context, minimum `2048` | Estimation uncertainty reserve |
 | `CONTEXT_ENGINE_STORE` | `~/.local-context-engine/store` | Content-addressed archive directory |
 | `CONTEXT_ENGINE_MAX_REQUEST_BYTES` | `16777216` | Maximum request body size |
+| `CONTEXT_TOKEN_ESTIMATOR` | unset | `shadow` enables passive comparison of character-estimator against a parallel exact `@lmstudio/sdk` runtime estimator, stored in JSONL. Does not alter budgeting. |
 | `CONTEXT_ENGINE_METRICS_JSONL` | `~/.local-context-engine/metrics.jsonl` | Metadata-only request metrics file; set `false` or empty to disable |
 
 Metrics contain numeric request composition, governor decisions, reserves, budgets, eviction counts, forwarding outcomes, and hashed session identity. They do not contain message, tool, argument, or result content.
+
+### Shadow estimator validation
+
+`CONTEXT_TOKEN_ESTIMATOR=shadow` is validated as 100% observational: budget decisions, reducer measurements, and final verification remain controlled by `CharacterTokenEstimator`; the LM Studio runtime estimator contributes metrics only. The `LMStudioRuntimeEstimator` matched LM Studio's own `usage.prompt_tokens` exactly in controlled baseline, tool-results, post-`LIVE_EVIDENCE`, and assistant-history scenarios, including an actual `assistant.tool_calls[]` → `tool`/`tool_call_id` → `function.arguments` sequence with tool definitions. Observed runtime-estimator latency was approximately 21–73 ms.
+
+The `CharacterTokenEstimator` showed both overestimation and underestimation, and must not be treated as safety-authoritative for tool-heavy prompts. Promotion to `runtime` authority is explicitly deferred to the next phase; runtime authority is not enabled in this phase. Reducer, governor, CAS, `LIVE_EVIDENCE`, and pruning behavior remain unchanged.
 
 ## Controlled Kilo + LM Studio experiment
 

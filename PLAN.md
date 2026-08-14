@@ -103,7 +103,8 @@ The final estimate includes messages and tool definitions. An advertised or theo
 
 Token accounting is exposed through a replaceable estimator interface rather than embedded in budgeting or reduction policy. Each estimate reports an explicit confidence level: `exact`, `conservative`, or `approximate`.
 
-The initial conservative character-based estimator is acceptable for v0.1. Model-specific tokenizers or runtime tokenization endpoints may be added later without changing the governor. Any approximation uncertainty must be absorbed by the safety reserve.
+The initial conservative character-based estimator is acceptable for v0.1 but not sufficient as safety-authoritative for tool-heavy requests. It can both underestimate (e.g. 146 estimated vs 330 actual due to LLM-injected json-schema tool definitions) and overestimate (e.g. 27K estimated vs 20K actual). 
+A pure observation mode `CONTEXT_TOKEN_ESTIMATOR=shadow` via `@lmstudio/sdk` is implemented and verified to match exact `prompt_tokens` natively. In future phases, the runtime estimator will be promoted to authoritative budget status. Any approximation uncertainty from non-exact estimators must be absorbed by the safety reserve.
 
 ## Deterministic reduction policy
 
