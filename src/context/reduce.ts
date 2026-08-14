@@ -80,38 +80,6 @@ function compactArchivedContent(handle: string): string {
   return `[Content archived]\nHandle: ${handle}`
 }
 
-function handleOnlyArchivedContent(handle: string): string {
-  return handle
-}
-
-function liveEvidenceExcerpt(
-  content: string,
-  handle: string,
-  originalTokens: number,
-  incrementalTokenBudget: number,
-  estimator: TokenEstimator,
-): { replacement: string; retainedTokens: number } {
-  const emptyMarker = liveEvidenceContentWithoutExcerpt(handle, originalTokens)
-  const emptyTokens = estimator.estimateText(emptyMarker)
-  let low = 0
-  let high = content.length
-  let replacement = emptyMarker
-  let retainedTokens = emptyTokens
-  while (low <= high) {
-    const middle = Math.floor((low + high) / 2)
-    const candidate = liveEvidenceContent(handle, originalTokens, preview(content, middle), estimator)
-    const candidateTokens = estimator.estimateText(candidate)
-    if (candidateTokens - emptyTokens <= incrementalTokenBudget) {
-      replacement = candidate
-      retainedTokens = candidateTokens
-      low = middle + 1
-    } else {
-      high = middle - 1
-    }
-  }
-  return { replacement, retainedTokens }
-}
-
 export async function reduceRequestToBudget(
   request: ChatCompletionRequest,
   budget: ContextBudget,
@@ -213,19 +181,25 @@ export async function reduceRequestToBudget(
       }
     }
 
+    // LIVE_EVIDENCE remains hard-overflow-only. Do not use it merely to chase
+    // the governor's proactive target below safeInput.
     if (afterTokens > budget.safeInput) {
       const liveCandidates = allToolCandidates
         .filter((candidate) => liveEvidenceIndexes.has(candidate.messageIndex))
         .sort((left, right) => right.messageIndex - left.messageIndex)
       const liveSafetyMargin = Math.max(0, Math.floor(options.liveEvidenceSafetyMarginTokens ?? 64))
+      const liveFitLimit = Math.max(1, budget.safeInput - liveSafetyMargin)
       const liveEntries = [] as Array<{
         candidate: (typeof liveCandidates)[number]
         originalContent: string
         handle: string
         originalTokens: number
-        markerOverhead: number
+        emptyMarker: string
         record: EvictionRecord
       }>
+
+      // First establish the minimum LIVE_EVIDENCE footprint. This tells us
+      // whether the protected request + semantic archive markers can fit at all.
       for (const candidate of liveCandidates) {
         const originalContent = candidate.content
         const originalTokens = estimator.estimateText(originalContent)
@@ -245,29 +219,61 @@ export async function reduceRequestToBudget(
           originalContent,
           handle: stored.handle,
           originalTokens,
-          markerOverhead: record.retainedTokens,
+          emptyMarker,
           record,
         })
       }
 
       afterTokens = (await measure(reduced)).tokens
-      let availableLiveBudget = Math.max(0, budget.safeInput - afterTokens - liveSafetyMargin)
-      for (const entry of liveEntries) {
-        const excerpt = liveEvidenceExcerpt(
-          entry.originalContent,
-          entry.handle,
-          entry.originalTokens,
-          Math.min(entry.originalTokens, availableLiveBudget),
-          estimator,
-        )
-        const incrementalTokens = Math.max(0, excerpt.retainedTokens - entry.markerOverhead)
-        entry.candidate.message.content = excerpt.replacement
-        entry.record.retainedTokens = excerpt.retainedTokens
-        availableLiveBudget -= incrementalTokens
+
+      // Only restore excerpts when the marker-only request already fits.
+      // Crucially, every trial is checked with the same whole-request
+      // authoritative measurement used by Measure/Budget/Verify. The previous
+      // implementation converted an exact remaining budget into heuristic
+      // CharacterTokenEstimator tokens, which could preserve too much live
+      // evidence and still fail final Verify.
+      if (afterTokens <= budget.safeInput) {
+        for (const entry of liveEntries) {
+          // If the configured safety margin is already consumed by the
+          // marker-only request, preserve markers only rather than turning the
+          // margin into another hard failure.
+          if (afterTokens > liveFitLimit) break
+
+          let low = 0
+          let high = entry.originalContent.length
+          let bestReplacement = entry.emptyMarker
+          let bestRetainedTokens = estimator.estimateText(entry.emptyMarker)
+          let bestMeasuredTokens = afterTokens
+
+          while (low <= high) {
+            const retainedCharacters = Math.floor((low + high) / 2)
+            const replacement = liveEvidenceContent(
+              entry.handle,
+              entry.originalTokens,
+              preview(entry.originalContent, retainedCharacters),
+              estimator,
+            )
+            entry.candidate.message.content = replacement
+            const measuredTokens = (await measure(reduced)).tokens
+
+            if (measuredTokens <= liveFitLimit) {
+              bestReplacement = replacement
+              bestRetainedTokens = estimator.estimateText(replacement)
+              bestMeasuredTokens = measuredTokens
+              low = retainedCharacters + 1
+            } else {
+              high = retainedCharacters - 1
+            }
+          }
+
+          entry.candidate.message.content = bestReplacement
+          entry.record.retainedTokens = bestRetainedTokens
+          afterTokens = bestMeasuredTokens
+        }
       }
+
       afterTokens = (await measure(reduced)).tokens
     }
-
   }
 
   const result: ReductionResult = {

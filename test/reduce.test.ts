@@ -200,6 +200,68 @@ test("archives LIVE_EVIDENCE only under hard overflow with a dynamic bounded exc
   })
 })
 
+test("LIVE_EVIDENCE excerpt fitting uses authoritative whole-request measurement", async () => {
+  await withStore(async (store) => {
+    const currentOutput = `${"HEAD ".repeat(500)}${"TAIL ".repeat(500)}`
+    const request: ChatCompletionRequest = {
+      model: "local-model",
+      messages: [
+        { role: "system", content: "S".repeat(120) },
+        { role: "user", content: "inspect current evidence" },
+        {
+          role: "assistant",
+          content: "reading",
+          tool_calls: [{ id: "call_current", type: "function", function: { name: "read", arguments: "{}" } }],
+        },
+        { role: "tool", name: "read", tool_call_id: "call_current", content: currentOutput },
+      ],
+    }
+    const liveBudget = createContextBudget({ effectiveContext: 1_000, outputReserve: 200, safetyReserve: 100 })
+
+    // Deliberately model a runtime where tool-message content consumes about
+    // twice as many tokens as CharacterTokenEstimator predicts. This reproduces
+    // the class of failure seen with exact LM Studio measurement: converting an
+    // exact remaining budget into heuristic excerpt tokens can preserve too
+    // much LIVE_EVIDENCE and miss final Verify.
+    const measureRequest = async (candidate: ChatCompletionRequest): Promise<{ tokens: number }> => {
+      let tokens = 0
+      for (const message of candidate.messages) {
+        if (message.role === "tool" && typeof message.content === "string") {
+          tokens += Math.ceil(message.content.length / 2)
+        } else {
+          tokens += Math.ceil(JSON.stringify(message).length / 4)
+        }
+      }
+      if (candidate.tools !== undefined) tokens += Math.ceil(JSON.stringify(candidate.tools).length / 4)
+      return { tokens }
+    }
+
+    const initial = await measureRequest(request)
+    assert.ok(initial.tokens > liveBudget.safeInput)
+
+    const result = await reduceRequestToBudget(request, liveBudget, store, {
+      measureRequest,
+      targetTokens: 100,
+      liveEvidenceSafetyMarginTokens: 64,
+    })
+
+    assert.equal(result.fits, true)
+    assert.ok(result.afterTokens <= liveBudget.safeInput)
+    assert.equal(result.afterTokens, (await measureRequest(result.request)).tokens)
+
+    const eviction = result.evictions.find((entry) => entry.reductionClass === "LIVE_EVIDENCE")
+    assert.ok(eviction)
+    assert.equal(await store.get(eviction.handle), currentOutput)
+
+    const archived = String(result.request.messages[3]!.content)
+    assert.match(archived, /^\[Current tool output partially archived\]/)
+    assert.match(archived, /Handle: ctx:\/\/sha256\/[a-f0-9]{64}/)
+    assert.notEqual(archived, eviction.handle)
+    assert.deepEqual(result.request.messages[2]!.tool_calls, request.messages[2]!.tool_calls)
+    assert.equal(result.request.messages[3]!.tool_call_id, "call_current")
+  })
+})
+
 test("does not archive LIVE_EVIDENCE to chase targetTokens below safeInput", async () => {
   await withStore(async (store) => {
     const currentOutput = "CURRENT ".repeat(150)
