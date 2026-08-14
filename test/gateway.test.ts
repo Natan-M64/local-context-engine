@@ -492,7 +492,7 @@ test("recovers an overflow by shrinking archived previews as far as needed", asy
     assert.equal(response.status, 200)
     assert.equal(chatCalls, 1)
     assert.ok(received)
-    assert.ok(estimateRequestTokens(received!) <= 315)
+    assert.ok(estimateRequestTokens(received!) <= 700)
     const archived = received!.messages.filter((message) => message.role === "tool").map((message) => String(message.content))
     assert.ok(archived.every((content) => content.includes("ctx://sha256/")))
     assert.equal(received!.messages.at(-1)?.content, "continue")

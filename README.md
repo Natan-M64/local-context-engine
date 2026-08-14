@@ -12,7 +12,13 @@ The gateway conservatively measures the complete request, reserves output and sa
 
 ## Status
 
-Early v0.1 implementation. The repository is private while transport compatibility and runtime discovery are validated across local inference servers.
+Daily driver stabilization release (v0.2 ready). Provides transparent OpenAI-compatible proxying, exact LM Studio runtime token measurement, and conservative generic fallback.
+
+## Validated Runtimes & Adapters
+
+- **LM Studio**: Exact token measurement via `@lmstudio/sdk` (`TokenMeasurementProvider`), matching native `prompt_tokens`.
+- **Generic / OpenAI-compatible**: Conservative character-based fallback for unvalidated runtimes.
+- **Planned / Community roadmap**: Ollama, oMLX, llama.cpp, vLLM.
 
 ## Requirements
 
@@ -25,44 +31,23 @@ Early v0.1 implementation. The repository is private while transport compatibili
 npm install
 npm run check
 npm run build
+npm link
 ```
 
-## Run locally
+## Recommended Daily Driver Usage
 
 ```bash
 CONTEXT_ENGINE_UPSTREAM_URL=http://127.0.0.1:1234/v1 \
 CONTEXT_GOVERNOR_MODE=govern \
+CONTEXT_TOKEN_ESTIMATOR=auto \
 CONTEXT_OUTPUT_RESERVE=4096 \
 CONTEXT_SAFETY_RESERVE=2048 \
-node dist/src/cli.js
+local-context-engine
 ```
 
-The gateway listens on `http://127.0.0.1:18181/v1` by default. Configure an OpenAI-compatible client to use that base URL instead of the runtime URL.
+The gateway listens on `http://127.0.0.1:18181/v1` by default. Configure Kilo or any OpenAI-compatible client to point to `http://127.0.0.1:18181/v1`.
 
-If the runtime does not report the context physically loaded for the selected model, set a conservative fallback:
-
-```bash
-CONTEXT_WINDOW_TOKENS=25088 node dist/src/cli.js
-```
-
-## Local network access
-
-Bind the gateway to all network interfaces:
-
-```bash
-CONTEXT_ENGINE_HOST=0.0.0.0 \
-CONTEXT_ENGINE_PORT=18181 \
-CONTEXT_ENGINE_UPSTREAM_URL=http://127.0.0.1:1234/v1 \
-CONTEXT_OUTPUT_RESERVE=4096 \
-CONTEXT_SAFETY_RESERVE=2048 \
-node dist/src/cli.js
-```
-
-Other devices on the same network can then use `http://<host-lan-ip>:18181/v1`. The upstream runtime can remain bound to loopback because the gateway accesses it on the same host.
-
-The gateway currently has no authentication or TLS. Expose it only on a trusted local network, restrict port `18181` with the host firewall, and do not port-forward it to the internet.
-
-## Configuration
+If LM Studio is running, the engine automatically discovers physical loaded context and uses exact LM Studio prompt token measurement for budgeting, eviction, and verification.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
@@ -75,7 +60,7 @@ The gateway currently has no authentication or TLS. Expose it only on a trusted 
 | `CONTEXT_SAFETY_RESERVE` | 8% of context, minimum `2048` | Estimation uncertainty reserve |
 | `CONTEXT_ENGINE_STORE` | `~/.local-context-engine/store` | Content-addressed archive directory |
 | `CONTEXT_ENGINE_MAX_REQUEST_BYTES` | `16777216` | Maximum request body size |
-| `CONTEXT_TOKEN_ESTIMATOR` | unset | `shadow` enables passive comparison of character-estimator against a parallel exact `@lmstudio/sdk` runtime estimator, stored in JSONL. Does not alter budgeting. |
+| `CONTEXT_TOKEN_ESTIMATOR` | `auto` | `auto` uses exact provider when available with fallback to generic; `static` forces character estimator; `shadow` uses character estimator for decisions while recording exact measurements. |
 | `CONTEXT_ENGINE_METRICS_JSONL` | `~/.local-context-engine/metrics.jsonl` | Metadata-only request metrics file; set `false` or empty to disable |
 
 Metrics contain numeric request composition, governor decisions, reserves, budgets, eviction counts, forwarding outcomes, and hashed session identity. They do not contain message, tool, argument, or result content.

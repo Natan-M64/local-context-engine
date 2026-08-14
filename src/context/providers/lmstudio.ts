@@ -5,7 +5,7 @@ import {
   type LLMTool,
 } from "@lmstudio/sdk"
 import type { ChatCompletionRequest, ChatMessage } from "../../types/openai.js"
-import type { TokenMeasurementProvider } from "./provider.js"
+import type { TokenMeasurement, TokenMeasurementProvider } from "./provider.js"
 
 export interface RuntimeEstimatorMetrics {
   static_tokens: number
@@ -102,7 +102,6 @@ export function mapTools(tools: unknown[] | undefined): LLMTool[] {
 
 export interface LMStudioTokenProviderOptions {
   baseUrl: string
-  verbose?: boolean
 }
 
 export class LMStudioTokenProvider implements TokenMeasurementProvider {
@@ -113,12 +112,25 @@ export class LMStudioTokenProvider implements TokenMeasurementProvider {
     this.client = new LMStudioClient({ baseUrl: `ws://${base.host}` })
   }
 
-  async estimateChatRequest(request: ChatCompletionRequest): Promise<number | undefined> {
+  async estimateChatRequest(request: ChatCompletionRequest): Promise<TokenMeasurement | undefined> {
     try {
-      const model = await this.client.llm.model(request.model ?? "", { verbose: false })
+      const controller = new AbortController()
+      const timer = setTimeout(() => controller.abort(), 1_000)
+      const model = await Promise.race([
+        this.client.llm.model(request.model ?? "", { verbose: false }),
+        new Promise<never>((_, reject) => {
+          controller.signal.addEventListener("abort", () => reject(new Error("LM Studio model connection timeout")))
+        }),
+      ]).finally(() => clearTimeout(timer))
+
       const messages = { messages: mapMessages(request.messages) }
       const formatted = await model.applyPromptTemplate(messages, { toolDefinitions: mapTools(request.tools) })
-      return model.countTokens(formatted)
+      const tokens = await model.countTokens(formatted)
+      return {
+        tokens,
+        source: "lmstudio_sdk",
+        confidence: "exact",
+      }
     } catch {
       return undefined
     }

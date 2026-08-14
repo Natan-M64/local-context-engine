@@ -1,10 +1,15 @@
 import type { ChatCompletionRequest } from "../../types/openai.js"
 
+export interface TokenMeasurement {
+  tokens: number
+  source: string
+  confidence: "exact" | "approximate"
+}
+
 export interface TokenMeasurementProvider {
   /**
    * Estimate the token count for a complete ChatCompletionRequest.
-   * Providers may return undefined if they do not support the request format
-   * or if the model is not found, triggering fallback to the generic provider.
+   * Returns a TokenMeasurement if successful, or undefined if the provider cannot handle the request.
    */
-  estimateChatRequest(request: ChatCompletionRequest): Promise<number | undefined>
+  estimateChatRequest(request: ChatCompletionRequest): Promise<TokenMeasurement | undefined>
 }

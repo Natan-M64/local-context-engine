@@ -101,10 +101,9 @@ The final estimate includes messages and tool definitions. An advertised or theo
 
 ## Token estimation
 
-Token accounting is exposed through a replaceable estimator interface rather than embedded in budgeting or reduction policy. Each estimate reports an explicit confidence level: `exact`, `conservative`, or `approximate`.
+Token accounting is exposed through a replaceable `TokenMeasurementProvider` interface with explicit confidence levels (`exact` or `approximate`).
 
-The initial conservative character-based estimator is acceptable for v0.1 but not sufficient as safety-authoritative for tool-heavy requests. It can both underestimate (e.g. 146 estimated vs 330 actual due to LLM-injected json-schema tool definitions) and overestimate (e.g. 27K estimated vs 20K actual). 
-A pure observation mode `CONTEXT_TOKEN_ESTIMATOR=shadow` via `@lmstudio/sdk` is implemented and verified to match exact `prompt_tokens` natively. In future phases, the runtime estimator will be promoted to authoritative budget status. Any approximation uncertainty from non-exact estimators must be absorbed by the safety reserve.
+In `CONTEXT_TOKEN_ESTIMATOR=auto` mode, when an exact provider such as `LMStudioTokenProvider` is active, its measurement is safety-authoritative for Measure, Budget, Evict (Fits), and Verify steps. When no exact provider is available or when set to `static`, the gateway falls back to `GenericConservativeProvider` (character-based estimation). In `shadow` mode, exact measurements are recorded in metrics while budgeting decisions use static character estimates.
 
 ## Deterministic reduction policy
 

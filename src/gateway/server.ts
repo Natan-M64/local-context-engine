@@ -7,8 +7,8 @@ import { resolveSessionIdentity, type SessionIdentitySource } from "../context/s
 import { FilesystemContentStore } from "../eviction/store.js"
 import { discoverRuntimeContext } from "../runtime/discovery.js"
 import type { ChatCompletionRequest } from "../types/openai.js"
-import { LlamaCppTokenProvider, LMStudioTokenProvider, OllamaTokenProvider, OmlxTokenProvider, GenericConservativeProvider, createTokenMeasurementProvider } from "../context/providers/index.js"
-import type { EngineConfig } from "../config.js"
+import { LMStudioTokenProvider, GenericConservativeProvider, createTokenMeasurementProvider, type TokenMeasurement } from "../context/providers/index.js"
+import type { EngineConfig, TokenEstimatorMode } from "../config.js"
 
 export interface RequestMetrics {
   requestTokensBefore?: number
@@ -36,7 +36,10 @@ export interface RequestMetrics {
   governorArmedAfter?: boolean
   governorTargetTokens?: number
   governorMode?: "protect" | "govern"
-  tokenEstimatorMode?: "shadow"
+  tokenEstimatorMode?: TokenEstimatorMode
+  measurement_source?: string
+  measurement_confidence?: "exact" | "approximate"
+  authoritative_input_tokens?: number
   static_tokens?: number
   runtime_tokens?: number
   estimator_delta?: number
@@ -152,6 +155,13 @@ export function createGatewayServer(
 ): Server {
   const store = new FilesystemContentStore(config.storeRoot)
   const governor = new MultiSessionGovernor()
+  const lmstudioProvider = new LMStudioTokenProvider({ baseUrl: config.upstreamBaseUrl })
+  const tokenMeasurementProvider = createTokenMeasurementProvider(
+    [
+      { capability: "lmstudio", create: () => lmstudioProvider },
+    ],
+    new GenericConservativeProvider((request) => estimateRequestTokens(request, new CharacterTokenEstimator()))
+  )
   return http.createServer(async (request, response) => {
     const controller = new AbortController()
     const chatCompletion = isChatCompletion(request)
@@ -183,36 +193,44 @@ export function createGatewayServer(
           return
         }
         const estimator = new CharacterTokenEstimator()
+        const providerMode = config.tokenEstimatorMode ?? "static"
+        metrics.tokenEstimatorMode = providerMode
         metrics.estimatorConfidence = estimator.confidence
-        metrics.requestTokensBefore = estimateRequestTokens(payload, estimator)
+
+        const measureRequest = async (req: ChatCompletionRequest): Promise<TokenMeasurement> => {
+          if (providerMode === "auto") {
+            try {
+              const measurement = await tokenMeasurementProvider.estimateChatRequest(req)
+              if (measurement !== undefined) return measurement
+            } catch {}
+          }
+          return {
+            tokens: estimateRequestTokens(req, estimator),
+            source: "generic_character",
+            confidence: "approximate",
+          }
+        }
+
+        const initialMeasurement = await measureRequest(payload)
+        metrics.measurement_source = initialMeasurement.source
+        metrics.measurement_confidence = initialMeasurement.confidence
+        metrics.authoritative_input_tokens = initialMeasurement.tokens
+        metrics.requestTokensBefore = initialMeasurement.tokens
         metrics.token_breakdown_before = estimateTokenBreakdown(payload, estimator)
         metrics.live_evidence_tokens_before = metrics.token_breakdown_before.current_tool_results
         const discovered = await discoverRuntimeContext(config.upstreamBaseUrl, payload.model)
-        
-        let runtimeEstimateTokens: number | undefined
-        if (config.tokenEstimatorMode === "shadow") {
+
+        if (providerMode === "shadow") {
           const t0 = performance.now()
           try {
-            const provider = createTokenMeasurementProvider(
-              [
-                { capability: "lmstudio", create: () => new LMStudioTokenProvider({ baseUrl: config.upstreamBaseUrl }) },
-                { capability: "ollama", create: () => new OllamaTokenProvider() },
-                { capability: "omlx", create: () => new OmlxTokenProvider() },
-                { capability: "llamacpp", create: () => new LlamaCppTokenProvider() },
-              ],
-              new GenericConservativeProvider((request) => estimateRequestTokens(request, new CharacterTokenEstimator()))
-            )
-            runtimeEstimateTokens = await provider.estimateChatRequest(payload)
+            const shadowMeasurement = await tokenMeasurementProvider.estimateChatRequest(payload)
             metrics.runtime_estimator_latency_ms = Math.round(performance.now() - t0)
             metrics.static_tokens = metrics.requestTokensBefore
-            if (runtimeEstimateTokens !== undefined) {
-              metrics.runtime_tokens = runtimeEstimateTokens
+            if (shadowMeasurement !== undefined) {
+              metrics.runtime_tokens = shadowMeasurement.tokens
+              metrics.estimator_delta = metrics.static_tokens - shadowMeasurement.tokens
+              metrics.estimator_ratio = shadowMeasurement.tokens > 0 ? metrics.static_tokens / shadowMeasurement.tokens : 0
             }
-            if (metrics.static_tokens !== undefined && runtimeEstimateTokens !== undefined) {
-              metrics.estimator_delta = metrics.static_tokens - runtimeEstimateTokens
-              metrics.estimator_ratio = runtimeEstimateTokens > 0 ? metrics.static_tokens / runtimeEstimateTokens : 0
-            }
-            metrics.tokenEstimatorMode = "shadow"
           } catch (e) {
             process.stderr.write(`Runtime estimator failed: ${e instanceof Error ? e.message : String(e)}\n`)
             metrics.runtime_estimator_latency_ms = Math.round(performance.now() - t0)
@@ -294,7 +312,7 @@ export function createGatewayServer(
         const reduceForGoal = async (goal: ReductionGoal): Promise<ReductionResult> => {
           if (!goal.shouldReduce && metrics.requestTokensBefore! <= budget.safeInput) return unchanged()
           const targetTokens = goal.shouldReduce ? goal.targetTokens : budget.safeInput
-          return reduceRequestToBudget(payload, budget, store, { estimator, targetTokens })
+          return reduceRequestToBudget(payload, budget, store, { estimator, measureRequest, targetTokens })
         }
 
         let reduced: ReductionResult
@@ -302,7 +320,7 @@ export function createGatewayServer(
           metrics.governorTriggered = false
           reduced = metrics.requestTokensBefore <= budget.safeInput
             ? unchanged()
-            : await reduceRequestToBudget(payload, budget, store, { estimator, targetTokens: budget.safeInput })
+            : await reduceRequestToBudget(payload, budget, store, { estimator, measureRequest, targetTokens: budget.safeInput })
         } else if (identity.governorKey === undefined) {
           const statelessGovernor = new MultiSessionGovernor()
           const state = statelessGovernor.getOrCreateState("request")
@@ -331,6 +349,7 @@ export function createGatewayServer(
           : Buffer.from(JSON.stringify(reduced.request))
         metrics.requestTokensBefore = reduced.beforeTokens
         metrics.requestTokensAfter = reduced.afterTokens
+        metrics.authoritative_input_tokens = reduced.afterTokens
         metrics.token_breakdown_after = estimateTokenBreakdown(reduced.request, estimator)
         recordLiveEvidenceMetrics(metrics, reduced, metrics.token_breakdown_after)
         metrics.reclaimedTokens = reduced.reclaimedTokens

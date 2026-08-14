@@ -118,6 +118,7 @@ export async function reduceRequestToBudget(
   store: ContentStore,
   options: {
     estimator?: TokenEstimator
+    measureRequest?: (request: ChatCompletionRequest) => Promise<{ tokens: number }>
     previewCharacters?: number
     minimumPreviewCharacters?: number
     emergencyPreviewCharacters?: number
@@ -127,12 +128,14 @@ export async function reduceRequestToBudget(
   } = {},
 ): Promise<ReductionResult> {
   const estimator = options.estimator ?? new CharacterTokenEstimator()
+  const measure = options.measureRequest ?? (async (req) => ({ tokens: estimateRequestTokens(req, estimator) }))
   const previewCharacters = options.previewCharacters ?? 1_200
   const minimumPreviewCharacters = Math.min(options.minimumPreviewCharacters ?? 160, previewCharacters)
   const emergencyPreviewCharacters = Math.min(options.emergencyPreviewCharacters ?? 0, minimumPreviewCharacters)
   const targetTokens = Math.max(1, Math.min(Math.floor(options.targetTokens ?? budget.safeInput), budget.safeInput))
   const reduced = structuredClone(request)
-  const beforeTokens = estimateRequestTokens(reduced, estimator)
+  const beforeMeasurement = await measure(reduced)
+  const beforeTokens = beforeMeasurement.tokens
   let afterTokens = beforeTokens
   const evictions: EvictionRecord[] = []
 
@@ -182,7 +185,7 @@ export async function reduceRequestToBudget(
       }
       evictions.push(record)
       archived.push({ candidate, originalContent, handle: stored.handle, bytes: stored.bytes, originalTokens, record })
-      afterTokens = estimateRequestTokens(reduced, estimator)
+      afterTokens = (await measure(reduced)).tokens
     }
 
     for (const retainedCharacters of [minimumPreviewCharacters, emergencyPreviewCharacters]) {
@@ -196,7 +199,7 @@ export async function reduceRequestToBudget(
         )
         entry.candidate.message.content = replacement
         entry.record.retainedTokens = estimator.estimateText(replacement)
-        afterTokens = estimateRequestTokens(reduced, estimator)
+        afterTokens = (await measure(reduced)).tokens
       }
     }
 
@@ -206,15 +209,7 @@ export async function reduceRequestToBudget(
         const replacement = compactArchivedContent(entry.handle)
         entry.candidate.message.content = replacement
         entry.record.retainedTokens = estimator.estimateText(replacement)
-        afterTokens = estimateRequestTokens(reduced, estimator)
-      }
-
-      for (const entry of archived) {
-        if (afterTokens <= targetTokens) break
-        const replacement = handleOnlyArchivedContent(entry.handle)
-        entry.candidate.message.content = replacement
-        entry.record.retainedTokens = estimator.estimateText(replacement)
-        afterTokens = estimateRequestTokens(reduced, estimator)
+        afterTokens = (await measure(reduced)).tokens
       }
     }
 
@@ -255,7 +250,7 @@ export async function reduceRequestToBudget(
         })
       }
 
-      afterTokens = estimateRequestTokens(reduced, estimator)
+      afterTokens = (await measure(reduced)).tokens
       let availableLiveBudget = Math.max(0, budget.safeInput - afterTokens - liveSafetyMargin)
       for (const entry of liveEntries) {
         const excerpt = liveEvidenceExcerpt(
@@ -270,7 +265,7 @@ export async function reduceRequestToBudget(
         entry.record.retainedTokens = excerpt.retainedTokens
         availableLiveBudget -= incrementalTokens
       }
-      afterTokens = estimateRequestTokens(reduced, estimator)
+      afterTokens = (await measure(reduced)).tokens
     }
 
   }

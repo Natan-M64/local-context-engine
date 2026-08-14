@@ -3,8 +3,10 @@ import path from "node:path"
 
 export type GovernorMode = "protect" | "govern"
 
+export type TokenEstimatorMode = "static" | "shadow" | "auto"
+
 export interface EngineConfig {
-  tokenEstimatorMode?: "shadow"
+  tokenEstimatorMode?: TokenEstimatorMode
   host: string
   port: number
   upstreamBaseUrl: string
@@ -44,6 +46,10 @@ export function configFromEnvironment(environment: NodeJS.ProcessEnv = process.e
         : { metricsJsonlPath: environment.CONTEXT_ENGINE_METRICS_JSONL }),
     ...(environment.CONTEXT_ENGINE_SESSION_HEADER === undefined ? {} : { sessionIdentityHeader: environment.CONTEXT_ENGINE_SESSION_HEADER }),
     governorMode,
-    ...(environment.CONTEXT_TOKEN_ESTIMATOR === "shadow" ? { tokenEstimatorMode: "shadow" as const } : {}),
+    ...(environment.CONTEXT_TOKEN_ESTIMATOR === "static" ||
+    environment.CONTEXT_TOKEN_ESTIMATOR === "shadow" ||
+    environment.CONTEXT_TOKEN_ESTIMATOR === "auto"
+      ? { tokenEstimatorMode: environment.CONTEXT_TOKEN_ESTIMATOR }
+      : {}),
   }
 }

@@ -1,18 +1,21 @@
 import type { ChatCompletionRequest } from "../../types/openai.js"
-import type { TokenMeasurementProvider } from "./provider.js"
+import type { TokenMeasurement, TokenMeasurementProvider } from "./provider.js"
 
 export class GenericConservativeProvider implements TokenMeasurementProvider {
   constructor(private readonly estimate: (request: ChatCompletionRequest) => number) {}
 
-  async estimateChatRequest(request: ChatCompletionRequest): Promise<number> {
-    return this.estimate(request)
+  async estimateChatRequest(request: ChatCompletionRequest): Promise<TokenMeasurement> {
+    const tokens = this.estimate(request)
+    return {
+      tokens,
+      source: "generic_character",
+      confidence: "approximate",
+    }
   }
 }
 
-export type TokenMeasurementCapability = "lmstudio" | "ollama" | "omlx" | "llamacpp" | "generic"
-
 export interface TokenMeasurementProviderFactory {
-  capability: TokenMeasurementCapability
+  capability: string
   create(): TokenMeasurementProvider
 }
 
@@ -22,19 +25,30 @@ export class CapabilityTokenMeasurementProvider implements TokenMeasurementProvi
     private readonly fallback: TokenMeasurementProvider,
   ) {}
 
-  async estimateChatRequest(request: ChatCompletionRequest): Promise<number> {
+  async estimateChatRequest(request: ChatCompletionRequest): Promise<TokenMeasurement> {
     for (const factory of this.providers) {
       try {
-        const estimate = await factory.create().estimateChatRequest(request)
-        if (estimate !== undefined && Number.isFinite(estimate) && estimate >= 0) return estimate
+        const measurement = await factory.create().estimateChatRequest(request)
+        if (
+          measurement !== undefined &&
+          Number.isFinite(measurement.tokens) &&
+          measurement.tokens >= 0
+        ) {
+          return measurement
+        }
       } catch {
         continue
       }
     }
-    return this.fallback.estimateChatRequest(request).then((estimate) => {
-      if (estimate === undefined || !Number.isFinite(estimate) || estimate < 0) throw new RangeError("generic token provider returned an invalid estimate")
-      return estimate
-    })
+    const fallbackMeasurement = await this.fallback.estimateChatRequest(request)
+    if (
+      fallbackMeasurement === undefined ||
+      !Number.isFinite(fallbackMeasurement.tokens) ||
+      fallbackMeasurement.tokens < 0
+    ) {
+      throw new RangeError("generic token provider returned an invalid estimate")
+    }
+    return fallbackMeasurement
   }
 }
 
@@ -45,24 +59,6 @@ export function createTokenMeasurementProvider(
   return new CapabilityTokenMeasurementProvider(factories, fallback)
 }
 
-export class OllamaTokenProvider implements TokenMeasurementProvider {
-  async estimateChatRequest(_request: ChatCompletionRequest): Promise<number | undefined> {
-    return undefined
-  }
-}
-
-export class OmlxTokenProvider implements TokenMeasurementProvider {
-  async estimateChatRequest(_request: ChatCompletionRequest): Promise<number | undefined> {
-    return undefined
-  }
-}
-
-export class LlamaCppTokenProvider implements TokenMeasurementProvider {
-  async estimateChatRequest(_request: ChatCompletionRequest): Promise<number | undefined> {
-    return undefined
-  }
-}
-
 export { LMStudioTokenProvider } from "./lmstudio.js"
 export type { LMStudioTokenProviderOptions } from "./lmstudio.js"
-export type { TokenMeasurementProvider as TokenMeasurementProviderInterface } from "./provider.js"
+export type { TokenMeasurement, TokenMeasurementProvider } from "./provider.js"
