@@ -6,6 +6,7 @@ export interface RuntimeContext {
 interface RuntimeModel {
   id?: string
   key?: string
+  type?: string
   loaded_instances?: Array<{
     id?: string
     config?: { context_length?: number }
@@ -23,9 +24,11 @@ export function loadedContextFromModels(payload: unknown, modelId?: string): num
   const models = Array.isArray(container.models) ? container.models : container.data
   if (!Array.isArray(models)) return undefined
 
-  const loaded = models.flatMap((model) =>
-    (model.loaded_instances ?? []).map((instance) => ({ model, instance })),
-  )
+  const loaded = models
+    .filter((model) => model.type !== "embedding")
+    .flatMap((model) =>
+      (model.loaded_instances ?? []).map((instance) => ({ model, instance })),
+    )
   const selected = loaded.find(({ model, instance }) =>
     model.id === modelId || model.key === modelId || instance.id === modelId,
   ) ?? (loaded.length === 1 ? loaded[0] : undefined)

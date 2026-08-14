@@ -54,6 +54,118 @@ test("archives old tool outputs until the request fits", async () => {
   })
 })
 
+test("shrinks archived previews when the first eviction pass narrowly misses the budget", async () => {
+  await withStore(async (store) => {
+    const oldOutput = "EVIDENCE ".repeat(300)
+    const request: ChatCompletionRequest = {
+      messages: [
+        { role: "system", content: "S".repeat(1_300) },
+        { role: "user", content: "preserve this request" },
+        { role: "tool", tool_call_id: "old", content: oldOutput },
+      ],
+    }
+    await assert.rejects(
+      reduceRequestToBudget(request, budget, store, {
+        previewCharacters: 1_200,
+        minimumPreviewCharacters: 1_200,
+        emergencyPreviewCharacters: 1_200,
+        compactArchiveMetadata: false,
+      }),
+      ContextBudgetExceededError,
+    )
+    const result = await reduceRequestToBudget(request, budget, store, {
+      previewCharacters: 1_200,
+      minimumPreviewCharacters: 160,
+    })
+    assert.equal(result.fits, true)
+    assert.equal(result.evictions.length, 1)
+    assert.ok(result.evictions[0]!.retainedTokens < 200)
+    const archived = String(result.request.messages[2]!.content)
+    assert.match(archived, /Handle: ctx:\/\/sha256\//)
+    assert.match(archived, /Preview:\nEVIDENCE/)
+    assert.equal(archived.match(/\[Tool output archived\]/g)?.length, 1)
+    assert.equal(await store.get(result.evictions[0]!.handle), oldOutput)
+    assert.deepEqual(request.messages[2]!.content, oldOutput)
+  })
+})
+
+test("removes archived previews when minimum previews still exceed the budget", async () => {
+  await withStore(async (store) => {
+    const outputs = Array.from({ length: 8 }, (_, index) => `EVIDENCE ${index} `.repeat(250))
+    const request: ChatCompletionRequest = {
+      messages: [
+        { role: "system", content: "system" },
+        { role: "user", content: "preserve this request" },
+        ...outputs.map((content, index) => ({ role: "tool" as const, tool_call_id: String(index), content })),
+      ],
+    }
+    await assert.rejects(
+      reduceRequestToBudget(request, budget, store, {
+        minimumPreviewCharacters: 160,
+        emergencyPreviewCharacters: 160,
+        compactArchiveMetadata: false,
+      }),
+      ContextBudgetExceededError,
+    )
+    const result = await reduceRequestToBudget(request, budget, store)
+    assert.equal(result.fits, true)
+    assert.equal(result.evictions.length, outputs.length)
+    const archivedMessages = result.evictions.map((eviction, index) => {
+      const archived = String(result.request.messages[index + 2]!.content)
+      assert.match(archived, /Handle: ctx:\/\/sha256\//)
+      assert.equal(archived.match(/\[Tool output archived\]/g)?.length, 1)
+      return archived
+    })
+    assert.ok(archivedMessages.some((archived) => /Preview:\n$/.test(archived)))
+    for (const [index, eviction] of result.evictions.entries()) {
+      assert.equal(await store.get(eviction.handle), outputs[index])
+    }
+  })
+})
+
+test("compacts archive metadata when empty previews narrowly miss the budget", async () => {
+  await withStore(async (store) => {
+    const oldOutput = "EVIDENCE ".repeat(300)
+    const request: ChatCompletionRequest = {
+      messages: [
+        { role: "system", content: "S".repeat(2_500) },
+        { role: "user", content: "preserve this request" },
+        { role: "tool", tool_call_id: "old", content: oldOutput },
+      ],
+    }
+    const result = await reduceRequestToBudget(request, budget, store)
+    assert.equal(result.fits, true)
+    assert.equal(result.evictions.length, 1)
+    assert.equal(result.request.messages[2]!.content, result.evictions[0]!.handle)
+    assert.equal(await store.get(result.evictions[0]!.handle), oldOutput)
+    assert.deepEqual(request.messages[2]!.content, oldOutput)
+  })
+})
+
+test("uses only the archive handle when the compact marker still exceeds the budget", async () => {
+  await withStore(async (store) => {
+    const outputs = Array.from({ length: 20 }, (_, index) => `EVIDENCE ${index} `.repeat(250))
+    const request: ChatCompletionRequest = {
+      messages: [
+        { role: "system", content: "S".repeat(56_600) },
+        { role: "user", content: "preserve this request" },
+        ...outputs.map((content, index) => ({ role: "tool" as const, tool_call_id: String(index), content })),
+      ],
+    }
+    const result = await reduceRequestToBudget(request, createContextBudget({ effectiveContext: 25_088, outputReserve: 4_096, safetyReserve: 6_144 }), store)
+    assert.equal(result.fits, true)
+    assert.equal(result.evictions.length, outputs.length)
+    let handleOnlyCount = 0
+    for (const [index, eviction] of result.evictions.entries()) {
+      const content = result.request.messages[index + 2]!.content
+      assert.equal(typeof content, "string")
+      if (content === eviction.handle) handleOnlyCount += 1
+      assert.equal(await store.get(eviction.handle), outputs[index])
+    }
+    assert.ok(handleOnlyCount > 0)
+  })
+})
+
 test("fails closed when deterministic tool eviction cannot satisfy the budget", async () => {
   await withStore(async (store) => {
     const request: ChatCompletionRequest = {

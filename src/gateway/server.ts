@@ -19,6 +19,10 @@ export interface RequestMetrics {
   outputReserve?: number
   safetyReserve?: number
   estimatorConfidence?: EstimatorConfidence
+  streamCompleted?: boolean
+  streamDoneMarkerSeen?: boolean
+  streamFinishReasonSeen?: boolean
+  clientAborted?: boolean
   forwardingDecision: "forwarded" | "context_budget_exceeded" | "context_unknown" | "invalid_request" | "upstream_error"
 }
 
@@ -77,6 +81,13 @@ function isChatCompletion(request: http.IncomingMessage): boolean {
   return request.method === "POST" && /\/v1\/chat\/completions(?:\?|$)/.test(request.url ?? "")
 }
 
+function observeStreamChunk(metrics: RequestMetrics, previous: string, chunk: Uint8Array): string {
+  const text = previous + Buffer.from(chunk).toString("utf8")
+  if (text.includes("data: [DONE]")) metrics.streamDoneMarkerSeen = true
+  if (/"finish_reason"\s*:\s*"[^"]+"/.test(text)) metrics.streamFinishReasonSeen = true
+  return text.slice(-128)
+}
+
 export function createGatewayServer(
   config: EngineConfig,
   metricsSink: (metrics: RequestMetrics) => void = () => undefined,
@@ -86,9 +97,15 @@ export function createGatewayServer(
     const controller = new AbortController()
     const chatCompletion = isChatCompletion(request)
     const metrics: RequestMetrics = { forwardingDecision: "upstream_error" }
-    request.on("aborted", () => controller.abort())
+    request.on("aborted", () => {
+      metrics.clientAborted = true
+      controller.abort()
+    })
     response.on("close", () => {
-      if (!response.writableEnded) controller.abort()
+      if (!response.writableEnded) {
+        metrics.clientAborted = true
+        controller.abort()
+      }
     })
 
     try {
@@ -182,14 +199,23 @@ export function createGatewayServer(
         return
       }
       const reader = upstream.body.getReader()
+      const streaming = upstream.headers.get("content-type")?.includes("text/event-stream") ?? false
+      let streamObservation = ""
+      if (streaming) {
+        metrics.streamCompleted = false
+        metrics.streamDoneMarkerSeen = false
+        metrics.streamFinishReasonSeen = false
+      }
       try {
         while (true) {
           const chunk = await reader.read()
           if (chunk.done) break
+          if (streaming) streamObservation = observeStreamChunk(metrics, streamObservation, chunk.value)
           if (!response.write(Buffer.from(chunk.value))) {
             await new Promise<void>((resolve) => response.once("drain", resolve))
           }
         }
+        if (streaming) metrics.streamCompleted = true
       } finally {
         reader.releaseLock()
       }

@@ -31,6 +31,7 @@ function contentString(message: ChatMessage): string | undefined {
 }
 
 function preview(content: string, maxCharacters: number): string {
+  if (maxCharacters <= 0) return ""
   if (content.length <= maxCharacters) return content
   const head = Math.ceil(maxCharacters * 0.7)
   const tail = Math.floor(maxCharacters * 0.3)
@@ -47,14 +48,26 @@ function archivedContent(handle: string, bytes: number, tokens: number, retained
   ].join("\n")
 }
 
+function compactArchivedContent(handle: string): string {
+  return handle
+}
+
 export async function reduceRequestToBudget(
   request: ChatCompletionRequest,
   budget: ContextBudget,
   store: ContentStore,
-  options: { estimator?: TokenEstimator; previewCharacters?: number } = {},
+  options: {
+    estimator?: TokenEstimator
+    previewCharacters?: number
+    minimumPreviewCharacters?: number
+    emergencyPreviewCharacters?: number
+    compactArchiveMetadata?: boolean
+  } = {},
 ): Promise<ReductionResult> {
   const estimator = options.estimator ?? new CharacterTokenEstimator()
   const previewCharacters = options.previewCharacters ?? 1_200
+  const minimumPreviewCharacters = Math.min(options.minimumPreviewCharacters ?? 160, previewCharacters)
+  const emergencyPreviewCharacters = Math.min(options.emergencyPreviewCharacters ?? 0, minimumPreviewCharacters)
   const reduced: ChatCompletionRequest = {
     ...request,
     messages: request.messages.map((message) => ({ ...message })),
@@ -75,6 +88,14 @@ export async function reduceRequestToBudget(
         return right.content.length - left.content.length
       })
 
+    const archived = [] as Array<{
+      candidate: (typeof candidates)[number]
+      originalContent: string
+      handle: string
+      bytes: number
+      originalTokens: number
+      record: EvictionRecord
+    }>
     for (const candidate of candidates) {
       if (afterTokens <= budget.safeInput) break
       const originalTokens = estimator.estimateText(candidate.content)
@@ -86,14 +107,40 @@ export async function reduceRequestToBudget(
         preview(candidate.content, previewCharacters),
       )
       candidate.message.content = replacement
-      const retainedTokens = estimator.estimateText(replacement)
-      evictions.push({
+      const record: EvictionRecord = {
         messageIndex: candidate.messageIndex,
         handle: stored.handle,
         originalTokens,
-        retainedTokens,
-      })
+        retainedTokens: estimator.estimateText(replacement),
+      }
+      evictions.push(record)
+      archived.push({ candidate, originalContent: candidate.content, handle: stored.handle, bytes: stored.bytes, originalTokens, record })
       afterTokens = estimateRequestTokens(reduced, estimator)
+    }
+
+    for (const retainedCharacters of [minimumPreviewCharacters, emergencyPreviewCharacters]) {
+      for (const entry of archived) {
+        if (afterTokens <= budget.safeInput) break
+        const replacement = archivedContent(
+          entry.handle,
+          entry.bytes,
+          entry.originalTokens,
+          preview(entry.originalContent, retainedCharacters),
+        )
+        entry.candidate.message.content = replacement
+        entry.record.retainedTokens = estimator.estimateText(replacement)
+        afterTokens = estimateRequestTokens(reduced, estimator)
+      }
+    }
+
+    if (options.compactArchiveMetadata !== false) {
+      for (const entry of archived) {
+        if (afterTokens <= budget.safeInput) break
+        const replacement = compactArchivedContent(entry.handle)
+        entry.candidate.message.content = replacement
+        entry.record.retainedTokens = estimator.estimateText(replacement)
+        afterTokens = estimateRequestTokens(reduced, estimator)
+      }
     }
   }
 

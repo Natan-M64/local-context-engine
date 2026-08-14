@@ -23,3 +23,20 @@ test("reads a generic loaded context field", () => {
     data: [{ id: "local", loaded_instances: [{ config: { context_length: 32_768 } }] }],
   }, "local"), 32_768)
 })
+
+test("does not use an embedding context for a chat model", () => {
+  assert.equal(contextWindowFromModels({
+    models: [
+      {
+        type: "embedding",
+        key: "embedding",
+        loaded_instances: [{ id: "embedding", config: { context_length: 8_192 } }],
+      },
+      {
+        type: "llm",
+        key: "chat",
+        loaded_instances: [],
+      },
+    ],
+  }, "chat"), undefined)
+})

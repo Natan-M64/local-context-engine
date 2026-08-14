@@ -87,6 +87,61 @@ test("passes models through and reduces oversized chat requests before forwardin
   }
 })
 
+test("preserves streamed tool calls and records completion evidence", async () => {
+  const metrics: RequestMetrics[] = []
+  const events = [
+    'data: {"id":"x","choices":[{"index":0,"delta":{"content":"Vou analisar..."},"finish_reason":null}]}\n\n',
+    'data: {"id":"x","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"read","arguments":"{\\"path\\""}}]},"finish_reason":null}]}\n\n',
+    'data: {"id":"x","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":":\\"README.md\\"}"}}]},"finish_reason":null}]}\n\n',
+    'data: {"id":"x","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}\n\n',
+    "data: [DONE]\n\n",
+  ]
+  const upstream = http.createServer(async (request, response) => {
+    if (request.url === "/api/v1/models" || request.url === "/v1/models") {
+      response.writeHead(200, { "content-type": "application/json" })
+      response.end(JSON.stringify({ data: [] }))
+      return
+    }
+    for await (const _chunk of request) {
+      void _chunk
+    }
+    response.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" })
+    for (const event of events) response.write(event)
+    response.end()
+  })
+  const root = await mkdtemp(path.join(os.tmpdir(), "local-context-engine-"))
+  const upstreamPort = await listen(upstream)
+  const gateway = createGatewayServer({
+    host: "127.0.0.1",
+    port: 0,
+    upstreamBaseUrl: `http://127.0.0.1:${upstreamPort}/v1`,
+    contextWindow: 10_000,
+    outputReserve: 500,
+    safetyReserve: 500,
+    storeRoot: root,
+    maxRequestBytes: 1_000_000,
+  }, (entry) => metrics.push(entry))
+  const gatewayPort = await listen(gateway)
+  try {
+    const response = await fetch(`http://127.0.0.1:${gatewayPort}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "local", stream: true, messages: [{ role: "user", content: "inspect" }] }),
+    })
+    assert.equal(response.status, 200)
+    assert.match(response.headers.get("content-type") ?? "", /text\/event-stream/)
+    assert.equal(await response.text(), events.join(""))
+    assert.equal(metrics[0]?.streamCompleted, true)
+    assert.equal(metrics[0]?.streamDoneMarkerSeen, true)
+    assert.equal(metrics[0]?.streamFinishReasonSeen, true)
+    assert.equal(metrics[0]?.clientAborted, undefined)
+  } finally {
+    await close(gateway)
+    await close(upstream)
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 test("reduces the golden multi-read request below the safe input budget", async () => {
   let received: ChatCompletionRequest | undefined
   const upstream = http.createServer(async (request, response) => {
@@ -313,6 +368,65 @@ test("fails closed when runtime discovery and explicit context are unavailable",
     assert.equal(response.status, 503)
     assert.equal((await response.json() as { error: { type: string } }).error.type, "context_window_unknown")
     assert.equal(chatCalls, 0)
+  } finally {
+    await close(gateway)
+    await close(upstream)
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test("recovers an overflow by shrinking archived previews as far as needed", async () => {
+  let chatCalls = 0
+  let received: ChatCompletionRequest | undefined
+  const upstream = http.createServer(async (request, response) => {
+    if (request.url === "/api/v1/models" || request.url === "/v1/models") {
+      response.writeHead(200, { "content-type": "application/json" })
+      response.end(JSON.stringify({ data: [{ id: "local", type: "llm", loaded_instances: [{ config: { context_length: 1_000 } }] }] }))
+      return
+    }
+    chatCalls += 1
+    const chunks: Buffer[] = []
+    for await (const chunk of request) chunks.push(Buffer.from(chunk))
+    received = JSON.parse(Buffer.concat(chunks).toString("utf8")) as ChatCompletionRequest
+    response.writeHead(200, { "content-type": "application/json" })
+    response.end(JSON.stringify({ choices: [{ message: { role: "assistant", content: "done" }, finish_reason: "stop" }] }))
+  })
+  const root = await mkdtemp(path.join(os.tmpdir(), "local-context-engine-"))
+  const upstreamPort = await listen(upstream)
+  const gateway = createGatewayServer({
+    host: "127.0.0.1",
+    port: 0,
+    upstreamBaseUrl: `http://127.0.0.1:${upstreamPort}/v1`,
+    outputReserve: 200,
+    safetyReserve: 100,
+    storeRoot: root,
+    maxRequestBytes: 1_000_000,
+  })
+  const gatewayPort = await listen(gateway)
+  try {
+    const response = await fetch(`http://127.0.0.1:${gatewayPort}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "local",
+        messages: [
+          { role: "system", content: "system" },
+          { role: "user", content: "preserve this request" },
+          ...Array.from({ length: 8 }, (_, index) => ({
+            role: "tool",
+            tool_call_id: String(index),
+            content: `EVIDENCE ${index} `.repeat(250),
+          })),
+        ],
+      }),
+    })
+    assert.equal(response.status, 200)
+    assert.equal(chatCalls, 1)
+    assert.ok(received)
+    assert.ok(estimateRequestTokens(received!) <= 700)
+    const archived = received!.messages.slice(2).map((message) => String(message.content))
+    assert.ok(archived.every((content) => content.includes("[Tool output archived]")))
+    assert.ok(archived.some((content) => /Preview:\n$/.test(content)))
   } finally {
     await close(gateway)
     await close(upstream)
