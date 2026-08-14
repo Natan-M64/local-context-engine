@@ -7,6 +7,7 @@ import { resolveSessionIdentity, type SessionIdentitySource } from "../context/s
 import { FilesystemContentStore } from "../eviction/store.js"
 import { discoverRuntimeContext } from "../runtime/discovery.js"
 import type { ChatCompletionRequest } from "../types/openai.js"
+import { LMStudioRuntimeEstimator } from "../context/runtime-estimator.js"
 import type { EngineConfig } from "../config.js"
 
 export interface RequestMetrics {
@@ -35,6 +36,12 @@ export interface RequestMetrics {
   governorArmedAfter?: boolean
   governorTargetTokens?: number
   governorMode?: "protect" | "govern"
+  tokenEstimatorMode?: "shadow"
+  static_tokens?: number
+  runtime_tokens?: number
+  estimator_delta?: number
+  estimator_ratio?: number
+  runtime_estimator_latency_ms?: number
   token_breakdown_before?: TokenBreakdown
   token_breakdown_after?: TokenBreakdown
   live_evidence_tokens_before?: number
@@ -181,6 +188,24 @@ export function createGatewayServer(
         metrics.token_breakdown_before = estimateTokenBreakdown(payload, estimator)
         metrics.live_evidence_tokens_before = metrics.token_breakdown_before.current_tool_results
         const discovered = await discoverRuntimeContext(config.upstreamBaseUrl, payload.model)
+        
+        let runtimeEstimateTokens: number | undefined
+        if (config.tokenEstimatorMode === "shadow") {
+          const t0 = performance.now()
+          try {
+            const runtimeEstimator = new LMStudioRuntimeEstimator(config.upstreamBaseUrl)
+            runtimeEstimateTokens = await runtimeEstimator.estimateChatRequest(payload)
+            metrics.runtime_estimator_latency_ms = Math.round(performance.now() - t0)
+            metrics.static_tokens = metrics.requestTokensBefore
+            metrics.runtime_tokens = runtimeEstimateTokens
+            metrics.estimator_delta = metrics.static_tokens - metrics.runtime_tokens
+            metrics.estimator_ratio = metrics.runtime_tokens > 0 ? metrics.static_tokens / metrics.runtime_tokens : 0
+            metrics.tokenEstimatorMode = "shadow"
+          } catch (e) {
+            process.stderr.write(`Runtime estimator failed: ${e instanceof Error ? e.message : String(e)}\n`)
+            metrics.runtime_estimator_latency_ms = Math.round(performance.now() - t0)
+          }
+        }
         const effectiveContext = discovered?.effectiveContext ?? config.contextWindow
         const contextSource = discovered ? "loaded" : config.contextWindow === undefined ? undefined : "configured"
         if (effectiveContext === undefined || contextSource === undefined) {

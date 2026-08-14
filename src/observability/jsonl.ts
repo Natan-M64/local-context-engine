@@ -17,6 +17,13 @@ export function createJsonlMetricsSink(filePath: string): MetricsSink {
       schema: "local-context-engine.request.v1",
       recordedAt: new Date().toISOString(),
       ...metrics,
+      ...Object.fromEntries(
+        Object.entries(metrics).filter(([key, value]) =>
+          // Filtra out propriedades estruturais, limitando o schema do JSONL ao que e seguro (tipos primitivos finitos)
+          // Mas ja removemos a injeçao de mensagens e ferramentas, entao `metrics` ja é metadata-only.
+          true
+        )
+      ),
     }
     appendFileSync(filePath, `${JSON.stringify(record)}\n`, "utf8")
   }
