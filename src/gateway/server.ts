@@ -7,7 +7,7 @@ import { resolveSessionIdentity, type SessionIdentitySource } from "../context/s
 import { FilesystemContentStore } from "../eviction/store.js"
 import { discoverRuntimeContext } from "../runtime/discovery.js"
 import type { ChatCompletionRequest } from "../types/openai.js"
-import { LMStudioRuntimeEstimator } from "../context/runtime-estimator.js"
+import { LlamaCppTokenProvider, LMStudioTokenProvider, OllamaTokenProvider, OmlxTokenProvider, GenericConservativeProvider, createTokenMeasurementProvider } from "../context/providers/index.js"
 import type { EngineConfig } from "../config.js"
 
 export interface RequestMetrics {
@@ -193,13 +193,25 @@ export function createGatewayServer(
         if (config.tokenEstimatorMode === "shadow") {
           const t0 = performance.now()
           try {
-            const runtimeEstimator = new LMStudioRuntimeEstimator(config.upstreamBaseUrl)
-            runtimeEstimateTokens = await runtimeEstimator.estimateChatRequest(payload)
+            const provider = createTokenMeasurementProvider(
+              [
+                { capability: "lmstudio", create: () => new LMStudioTokenProvider({ baseUrl: config.upstreamBaseUrl }) },
+                { capability: "ollama", create: () => new OllamaTokenProvider() },
+                { capability: "omlx", create: () => new OmlxTokenProvider() },
+                { capability: "llamacpp", create: () => new LlamaCppTokenProvider() },
+              ],
+              new GenericConservativeProvider((request) => estimateRequestTokens(request, new CharacterTokenEstimator()))
+            )
+            runtimeEstimateTokens = await provider.estimateChatRequest(payload)
             metrics.runtime_estimator_latency_ms = Math.round(performance.now() - t0)
             metrics.static_tokens = metrics.requestTokensBefore
-            metrics.runtime_tokens = runtimeEstimateTokens
-            metrics.estimator_delta = metrics.static_tokens - metrics.runtime_tokens
-            metrics.estimator_ratio = metrics.runtime_tokens > 0 ? metrics.static_tokens / metrics.runtime_tokens : 0
+            if (runtimeEstimateTokens !== undefined) {
+              metrics.runtime_tokens = runtimeEstimateTokens
+            }
+            if (metrics.static_tokens !== undefined && runtimeEstimateTokens !== undefined) {
+              metrics.estimator_delta = metrics.static_tokens - runtimeEstimateTokens
+              metrics.estimator_ratio = runtimeEstimateTokens > 0 ? metrics.static_tokens / runtimeEstimateTokens : 0
+            }
             metrics.tokenEstimatorMode = "shadow"
           } catch (e) {
             process.stderr.write(`Runtime estimator failed: ${e instanceof Error ? e.message : String(e)}\n`)

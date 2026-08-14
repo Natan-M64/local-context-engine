@@ -2,7 +2,7 @@ import assert from "node:assert/strict"
 import test from "node:test"
 import { type ChatMessageData, type LLMTool } from "@lmstudio/sdk"
 import type { ChatMessage } from "../src/types/openai.js"
-import { mapMessages, mapTools } from "../src/context/runtime-estimator.js"
+import { mapMessages, mapTools } from "../src/context/providers/lmstudio.js"
 
 test("maps valid openai tool definitions to sdk strict types", () => {
   const tools: unknown[] = [

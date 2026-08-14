@@ -4,7 +4,8 @@ import {
   type ChatMessagePartTextData,
   type LLMTool,
 } from "@lmstudio/sdk"
-import type { ChatCompletionRequest, ChatMessage } from "../types/openai.js"
+import type { ChatCompletionRequest, ChatMessage } from "../../types/openai.js"
+import type { TokenMeasurementProvider } from "./provider.js"
 
 export interface RuntimeEstimatorMetrics {
   static_tokens: number
@@ -99,18 +100,27 @@ export function mapTools(tools: unknown[] | undefined): LLMTool[] {
   })
 }
 
-export class LMStudioRuntimeEstimator {
+export interface LMStudioTokenProviderOptions {
+  baseUrl: string
+  verbose?: boolean
+}
+
+export class LMStudioTokenProvider implements TokenMeasurementProvider {
   private readonly client: LMStudioClient
 
-  constructor(baseUrl: string) {
-    const base = new URL(baseUrl)
+  constructor(options: LMStudioTokenProviderOptions) {
+    const base = new URL(options.baseUrl)
     this.client = new LMStudioClient({ baseUrl: `ws://${base.host}` })
   }
 
-  async estimateChatRequest(request: ChatCompletionRequest): Promise<number> {
-    const model = await this.client.llm.model(request.model ?? "")
-    const messages = { messages: mapMessages(request.messages) }
-    const formatted = await model.applyPromptTemplate(messages, { toolDefinitions: mapTools(request.tools) })
-    return model.countTokens(formatted)
+  async estimateChatRequest(request: ChatCompletionRequest): Promise<number | undefined> {
+    try {
+      const model = await this.client.llm.model(request.model ?? "", { verbose: false })
+      const messages = { messages: mapMessages(request.messages) }
+      const formatted = await model.applyPromptTemplate(messages, { toolDefinitions: mapTools(request.tools) })
+      return model.countTokens(formatted)
+    } catch {
+      return undefined
+    }
   }
 }
