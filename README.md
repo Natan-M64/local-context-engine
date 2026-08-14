@@ -61,6 +61,7 @@ If LM Studio is running, the engine automatically discovers physical loaded cont
 | `CONTEXT_ENGINE_STORE` | `~/.local-context-engine/store` | Content-addressed archive directory |
 | `CONTEXT_ENGINE_MAX_REQUEST_BYTES` | `16777216` | Maximum request body size |
 | `CONTEXT_TOKEN_ESTIMATOR` | `auto` | `auto` uses exact provider when available with fallback to generic; `static` forces character estimator; `shadow` uses character estimator for decisions while recording exact measurements. |
+| `CONTEXT_REASONING_STREAM` | `passthrough` | `passthrough` preserves SSE bytes; `strip` removes only downstream `choices[*].delta.reasoning_content` from streaming chat completions. Invalid values use `passthrough`. |
 | `CONTEXT_ENGINE_METRICS_JSONL` | `~/.local-context-engine/metrics.jsonl` | Metadata-only request metrics file; set `false` or empty to disable |
 
 Metrics contain numeric request composition, governor decisions, reserves, budgets, eviction counts, forwarding outcomes, and hashed session identity. They do not contain message, tool, argument, or result content.
@@ -70,6 +71,18 @@ Metrics contain numeric request composition, governor decisions, reserves, budge
 `CONTEXT_TOKEN_ESTIMATOR=shadow` is validated as 100% observational: budget decisions, reducer measurements, and final verification remain controlled by `CharacterTokenEstimator`; the LM Studio runtime estimator contributes metrics only. The `LMStudioRuntimeEstimator` matched LM Studio's own `usage.prompt_tokens` exactly in controlled baseline, tool-results, post-`LIVE_EVIDENCE`, and assistant-history scenarios, including an actual `assistant.tool_calls[]` → `tool`/`tool_call_id` → `function.arguments` sequence with tool definitions. Observed runtime-estimator latency was approximately 21–73 ms.
 
 The `CharacterTokenEstimator` showed both overestimation and underestimation, and must not be treated as authoritative for tool-heavy prompts. Reducer, governor, CAS, `LIVE_EVIDENCE`, and pruning behavior remain unchanged.
+
+## Reasoning stream compatibility
+
+Tests with Kilo/OpenCode, `@ai-sdk/openai-compatible`, LM Studio, and a reasoning-enabled Qwen model reproduced a lifecycle incompatibility when streamed `reasoning_content` preceded tool calls. The underlying OpenAI-compatible stream contained tool-call deltas, `finish_reason = "tool_calls"`, usage, and `[DONE]`, but Kilo could finish with `Tool execution aborted`. The cause has not been attributed definitively to LM Studio, Kilo, or the AI SDK.
+
+`CONTEXT_REASONING_STREAM=passthrough` is the default and keeps transparent byte forwarding. For combinations that reproduce the issue, `CONTEXT_REASONING_STREAM=strip` is an opt-in workaround that removes only `choices[*].delta.reasoning_content` downstream for streaming chat completions. The model continues reasoning upstream; content, tool calls, fragmented arguments, finish reasons, usage, other event metadata, and `[DONE]` remain preserved. Non-streaming responses are unchanged.
+
+Investigation remains open. Reproducible contributions covering reasoning, streaming, and tool calling are welcome. Whether `strip` should remain opt-in or gain narrower runtime-specific applicability is intentionally deferred rather than selected through client or model heuristics.
+
+## Hard overflow safety
+
+Hard-overflow reduction measures the complete request before and after each candidate and rejects candidates that do not reduce authoritative tokens. Historical assistant tool-call arguments may be archived through the existing content-addressed store only under hard overflow, while IDs, names, types, order, result pairing, the current tool round, and protected request structures remain intact. If deterministic reductions cannot fit `safe_input`, the gateway fails closed.
 
 ## Controlled Kilo + LM Studio experiment
 
