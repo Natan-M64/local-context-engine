@@ -1,0 +1,34 @@
+name: Feature request
+description: Suggest an improvement that fits the project roadmap
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please keep proposals focused on transport correctness, context budgeting, recoverable reduction, runtime interoperability, or observability. Do not include private prompts or production data.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What concrete problem would this solve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed Solution
+      description: Describe the behavior you would like to see.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives Considered
+      description: What workarounds or alternative designs have you tried?
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope and Invariants
+      description: Explain how this fits the roadmap and preserves fail-closed, protocol, and recoverability invariants.
+    validations:
+      required: true

@@ -1,0 +1,55 @@
+name: Bug report
+description: Create a report to help us reproduce and fix an issue
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting an issue! Please ensure you are not submitting confidential or private information.
+  - type: input
+    id: runtime-info
+    attributes:
+      label: Inference Runtime & Version
+      description: e.g., LM Studio 0.3.x, Ollama 0.5.x, etc.
+      placeholder: LM Studio v0.3.9
+    validations:
+      required: true
+  - type: input
+    id: model-info
+    attributes:
+      label: Model Name & Context Size
+      description: e.g., Qwen 2.5 Coder 7B (loaded context 25,088 tokens)
+      placeholder: Qwen2.5-Coder-7B-Instruct (loaded context: 25088)
+    validations:
+      required: true
+  - type: input
+    id: client-info
+    attributes:
+      label: Client / Agent Harness
+      description: e.g., Kilo CLI, OpenCode, Aider, custom script
+      placeholder: Kilo CLI
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to Reproduce
+      description: Clear and concise steps to reproduce the issue.
+      placeholder: |
+        1. Start local-context-engine with profile...
+        2. Execute tool-heavy command in client...
+        3. Observe...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected Behavior
+      description: What should have happened according to gateway invariants?
+    validations:
+      required: true
+  - type: textarea
+    id: logs-metrics
+    attributes:
+      label: Relevant Metrics / JSONL Excerpts
+      description: Paste relevant anonymized lines from ~/.local-context-engine/metrics.jsonl or gateway logs.
