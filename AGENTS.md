@@ -22,12 +22,14 @@ Do not add to the core:
 Every chat request follows:
 
 ```text
-Measure → Budget → Evict → Verify → Forward
+Measure → Budget → Evict/Reduce → Verify → Forward
 ```
 
-Never forward a request estimated above the safe input budget. If deterministic reduction cannot make it fit, fail locally with a structured `context_budget_exceeded` error.
+Never forward a request estimated above the authoritative safe input budget. If deterministic reduction cannot make it fit, fail locally with a structured `context_budget_exceeded` error; this is a correct gateway result when allowed safe reduction is insufficient.
 
 Preserve system messages, the latest user request, current protocol continuity, and recent relevant tool results. Evict large, old deterministic tool outputs first. Store evicted content by hash and retain a bounded preview plus a stable handle.
+
+Alpha release blockers are core transport, measurement, protocol, recoverability, and fail-closed invariants—not task completion or model quality. Agent/model tool loops, harness step limits, and poor task outcomes are outside the gateway core. New reduction strategies require reproducible evidence of an invariant violation and a focused regression test; do not turn every model failure into a reducer feature.
 
 ## Engineering rules
 
