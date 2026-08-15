@@ -422,6 +422,123 @@ test("never accepts a LIVE_EVIDENCE candidate that increases authoritative token
   })
 })
 
+test("uses minimal archived markers to resolve a narrow authoritative hard overflow", async () => {
+  await withStore(async (store) => {
+    const oldOutput = "O".repeat(4_000)
+    const oldArguments = JSON.stringify({ query: "Q".repeat(4_000) })
+    const currentArguments = JSON.stringify({ path: "current.txt" })
+    const request: ChatCompletionRequest = {
+      messages: [
+        { role: "system", content: "protected system" },
+        { role: "user", content: "original requirement" },
+        { role: "assistant", tool_calls: [{ id: "old", type: "function", function: { name: "grep", arguments: oldArguments } }] },
+        { role: "tool", tool_call_id: "old", content: oldOutput },
+        { role: "assistant", tool_calls: [{ id: "current", type: "function", function: { name: "read", arguments: currentArguments } }] },
+        { role: "tool", tool_call_id: "current", content: "current evidence" },
+      ],
+      tools: [{ type: "function", function: { name: "read", description: "protected description", parameters: { type: "object" } } }],
+    }
+    const measureRequest = async (candidate: ChatCompletionRequest): Promise<{ tokens: number }> => {
+      const safe = String(candidate.messages[3]!.content)
+      const historical = (candidate.messages[2]!.tool_calls as Array<{ function: { arguments: string } }>)[0]!.function.arguments
+      if (safe === oldOutput) return { tokens: 44_303 }
+      if (historical === oldArguments) return { tokens: 14_148 }
+      if (safe.startsWith("[Content archived]")) return { tokens: 14_098 }
+      if (safe.startsWith("[Archived]")) return { tokens: 14_078 }
+      return { tokens: 14_090 }
+    }
+    const narrowBudget = createContextBudget({ effectiveContext: 20_224, outputReserve: 4_096, safetyReserve: 2_048 })
+
+    const result = await reduceRequestToBudget(request, narrowBudget, store, { measureRequest, targetTokens: 6_336 })
+
+    assert.equal(result.beforeTokens, 44_303)
+    assert.equal(narrowBudget.safeInput, 14_080)
+    assert.equal(result.afterTokens, 14_078)
+    assert.equal(result.fits, true)
+    assert.equal(result.evictions.length, 2)
+    const safeEviction = result.evictions.find((entry) => entry.reductionClass === "SAFE")
+    const argumentEviction = result.evictions.find((entry) => entry.reductionClass === "HISTORICAL_ARGUMENT")
+    assert.ok(safeEviction)
+    assert.ok(argumentEviction)
+    assert.equal(result.request.messages[3]!.content, `[Archived]\n${safeEviction.handle}`)
+    assert.equal(await store.get(safeEviction.handle), oldOutput)
+    assert.equal(await store.get(argumentEviction.handle), oldArguments)
+    const oldCall = (result.request.messages[2]!.tool_calls as Array<{ id: string; type: string; function: { name: string; arguments: string } }>)[0]!
+    const currentCall = (result.request.messages[4]!.tool_calls as Array<{ id: string; function: { arguments: string } }>)[0]!
+    assert.deepEqual(JSON.parse(oldCall.function.arguments), { _archived: true, handle: argumentEviction.handle })
+    assert.equal(oldCall.id, "old")
+    assert.equal(oldCall.type, "function")
+    assert.equal(oldCall.function.name, "grep")
+    assert.equal(result.request.messages[3]!.tool_call_id, "old")
+    assert.equal(currentCall.function.arguments, currentArguments)
+    assert.equal(result.request.messages[5]!.content, "current evidence")
+    assert.deepEqual(result.request.tools, request.tools)
+    assert.equal(result.request.messages[0]!.content, "protected system")
+    assert.equal(result.request.messages[1]!.content, "original requirement")
+  })
+})
+
+test("minimizes an already archived historical argument only when needed to fit", async () => {
+  await withStore(async (store) => {
+    const oldArguments = JSON.stringify({ query: "Q".repeat(4_000) })
+    const request: ChatCompletionRequest = {
+      messages: [
+        { role: "assistant", tool_calls: [{ id: "old", type: "function", function: { name: "grep", arguments: oldArguments } }] },
+        { role: "tool", tool_call_id: "old", content: "done" },
+        { role: "user", content: "continue" },
+      ],
+    }
+    const measureRequest = async (candidate: ChatCompletionRequest): Promise<{ tokens: number }> => {
+      const value = (candidate.messages[0]!.tool_calls as Array<{ function: { arguments: string } }>)[0]!.function.arguments
+      if (value === oldArguments) return { tokens: 900 }
+      return { tokens: JSON.parse(value)._archived === true ? 710 : 690 }
+    }
+
+    const result = await reduceRequestToBudget(request, budget, store, { measureRequest })
+
+    assert.equal(result.afterTokens, 690)
+    assert.equal(result.fits, true)
+    assert.equal(result.evictions.length, 1)
+    const eviction = result.evictions[0]!
+    assert.equal(eviction.reductionClass, "HISTORICAL_ARGUMENT")
+    assert.equal(await store.get(eviction.handle), oldArguments)
+    const call = (result.request.messages[0]!.tool_calls as Array<{ id: string; type: string; function: { name: string; arguments: string } }>)[0]!
+    assert.deepEqual(JSON.parse(call.function.arguments), { handle: eviction.handle })
+    assert.equal(call.id, "old")
+    assert.equal(call.type, "function")
+    assert.equal(call.function.name, "grep")
+    assert.equal(result.request.messages[1]!.tool_call_id, "old")
+    assert.equal(result.request.messages[2]!.content, "continue")
+  })
+})
+
+test("rejects non-beneficial emergency marker compaction using whole-request measurement", async () => {
+  await withStore(async (store) => {
+    const oldOutput = "O".repeat(4_000)
+    const request: ChatCompletionRequest = {
+      messages: [
+        { role: "system", content: "protected" },
+        { role: "tool", tool_call_id: "old", content: oldOutput },
+        { role: "user", content: "continue" },
+      ],
+    }
+    const measureRequest = async (candidate: ChatCompletionRequest): Promise<{ tokens: number }> => {
+      const content = String(candidate.messages[1]!.content)
+      if (content === oldOutput) return { tokens: 900 }
+      if (content.startsWith("[Content archived]")) return { tokens: 710 }
+      return { tokens: 720 }
+    }
+
+    await assert.rejects(
+      reduceRequestToBudget(request, budget, store, { measureRequest }),
+      (error: unknown) => error instanceof ContextBudgetExceededError
+        && error.result.afterTokens === 710
+        && String(error.result.request.messages[1]!.content).startsWith("[Content archived]")
+        && !String(error.result.request.messages[1]!.content).startsWith("[Archived]"),
+    )
+  })
+})
+
 test("fails closed deterministically for the 325203-token hard-overflow class", async () => {
   await withStore(async (store) => {
     const request: ChatCompletionRequest = {

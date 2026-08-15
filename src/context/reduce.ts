@@ -80,11 +80,19 @@ function compactArchivedContent(handle: string): string {
   return `[Content archived]\nHandle: ${handle}`
 }
 
+function emergencyArchivedContent(handle: string): string {
+  return `[Archived]\n${handle}`
+}
+
 function archivedArgumentContent(handle: string): string {
   return JSON.stringify({
     _archived: true,
     handle,
   })
+}
+
+function emergencyArchivedArgumentContent(handle: string): string {
+  return JSON.stringify({ handle })
 }
 
 function parseValidJsonObject(value: string): boolean {
@@ -215,6 +223,13 @@ export async function reduceRequestToBudget(
       }
     }
 
+    const archivedArguments = [] as Array<{
+      messageIndex: number
+      fn: Record<string, unknown>
+      handle: string
+      marker: string
+      record: EvictionRecord
+    }>
     if (afterTokens > budget.safeInput) {
       const historicalArguments = reduced.messages.flatMap((message, messageIndex) => {
         if (message.role !== "assistant" || !Array.isArray(message.tool_calls) || !historicalAssistantIndexes.has(messageIndex)) return []
@@ -236,13 +251,15 @@ export async function reduceRequestToBudget(
           fn.arguments = entry.original
           continue
         }
-        evictions.push({
+        const record: EvictionRecord = {
           messageIndex: entry.messageIndex,
           handle: stored.handle,
           originalTokens: estimator.estimateText(entry.original),
           retainedTokens: estimator.estimateText(marker),
           reductionClass: "HISTORICAL_ARGUMENT",
-        })
+        }
+        evictions.push(record)
+        archivedArguments.push({ messageIndex: entry.messageIndex, fn, handle: stored.handle, marker, record })
         afterTokens = measuredTokens
       }
     }
@@ -305,6 +322,38 @@ export async function reduceRequestToBudget(
           reductionClass: "LIVE_EVIDENCE",
         })
         afterTokens = bestMeasuredTokens
+      }
+    }
+
+    if (afterTokens > budget.safeInput && options.compactArchiveMetadata !== false) {
+      for (const entry of archived) {
+        if (afterTokens <= budget.safeInput) break
+        const previous = entry.candidate.message.content
+        const replacement = emergencyArchivedContent(entry.handle)
+        entry.candidate.message.content = replacement
+        const measuredTokens = (await measure(reduced)).tokens
+        if (measuredTokens >= afterTokens) {
+          entry.candidate.message.content = previous
+          continue
+        }
+        entry.record.retainedTokens = estimator.estimateText(replacement)
+        afterTokens = measuredTokens
+      }
+    }
+
+    if (afterTokens > budget.safeInput) {
+      for (const entry of archivedArguments) {
+        if (afterTokens <= budget.safeInput) break
+        const marker = emergencyArchivedArgumentContent(entry.handle)
+        if (!parseValidJsonObject(marker)) continue
+        entry.fn.arguments = marker
+        const measuredTokens = (await measure(reduced)).tokens
+        if (measuredTokens >= afterTokens) {
+          entry.fn.arguments = entry.marker
+          continue
+        }
+        entry.record.retainedTokens = estimator.estimateText(marker)
+        afterTokens = measuredTokens
       }
     }
   }
