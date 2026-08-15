@@ -225,7 +225,7 @@ Emergency  90%
 
 All watermark percentages are relative to `safe_input`, never to the physical or effective context. Normal operation below rearm performs no reduction. Crossing high triggers enough eviction to return near target, not merely below high. The governor rearms only after meaningful growth, preventing repeated small reductions.
 
-The governor supports two experiment modes through `CONTEXT_GOVERNOR_MODE`: `protect` disables preventive reduction and applies SAFE-only eviction strictly above `safeInput`; `govern` enables watermarks and hysteresis while keeping preventive and hard-overflow reduction SAFE-only. This isolates proactive governor behavior without changing the hard-overflow policy.
+The governor supports two experiment modes through `CONTEXT_GOVERNOR_MODE`: `protect` disables preventive reduction and applies the same hard-overflow policy strictly above `safeInput`; `govern` enables SAFE-only preventive reduction through watermarks and hysteresis. In either mode, hard overflow reduces SAFE first, then may externalize bounded LIVE_EVIDENCE under the current policy before failing closed.
 
 Additional controls:
 
@@ -385,7 +385,7 @@ A change is complete when:
 The engine is not an agent, prompt collection, safe-tool suite, or harness configuration. It is a small context runtime with one governing philosophy:
 
 ```text
-Measure → Budget → Evict → Verify → Forward
+Measure → Budget → Evict/Reduce → Verify → Forward
 ```
 
 After that path is trustworthy:

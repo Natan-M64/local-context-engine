@@ -3,3 +3,4 @@ dist/
 .serena/
 .env
 .DS_Store
+local-context-engine-v0.2.0-alpha.1-finalization-prompt.md
