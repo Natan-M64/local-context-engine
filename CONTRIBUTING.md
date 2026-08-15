@@ -10,6 +10,15 @@ Contributions that improve protocol correctness, runtime interoperability, and t
 - Avoid introducing semantic compaction, behavioral prompts, or agent supervision into the core gateway.
 - Do not commit secrets, private tokens, benchmark dumps, or local storage artifacts.
 
+## Agent-assisted contributions (Claude Code, Codex, etc.)
+
+We welcome contributions developed with AI coding agents. If you are using an agent:
+
+- Ensure the agent reads and obeys `AGENTS.md` and `CLAUDE.md`.
+- Keep changes scoped to the current phase in `PLAN.md`.
+- Ensure all pull requests include focused regression tests and pass `npm run check && npm run build`.
+- Review the diff carefully to ensure no auto-generated debugging artifacts, transcripts, or private tokens are included.
+
 ## Development workflow
 
 ```bash
