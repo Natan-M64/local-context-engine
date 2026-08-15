@@ -1,6 +1,6 @@
 # Agent Instructions
 
-These instructions apply to human contributors and AI coding agents, including Claude Code, Codex, Kilo, and similar tools. `CLAUDE.md` contains the same agent contract in a Claude Code-specific discovery filename. When instructions conflict, preserve the narrower repository scope and the core invariants below.
+These instructions apply to human contributors and AI coding agents, including Claude Code, Codex, Kilo, and similar tools. When instructions conflict, preserve the narrower repository scope and the core invariants below.
 
 ## Mission
 

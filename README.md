@@ -1,5 +1,6 @@
 # Local Context Engine
 
+[![CI](https://github.com/Natan-M64/local-context-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/Natan-M64/local-context-engine/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/Natan-M64/local-context-engine?include_prereleases&style=flat-square&color=blue)](https://github.com/Natan-M64/local-context-engine/releases)
 [![License](https://img.shields.io/badge/license-Apache--2.0-green?style=flat-square)](LICENSE)
 [![Status](https://img.shields.io/badge/status-alpha.1--daily--testing-orange?style=flat-square)](VALIDATION.md)
