@@ -166,6 +166,32 @@ CONTEXT_REASONING_STREAM     strip (when testing the observed reasoning/tool com
 
 The 512-token reserve is intentionally a controlled exact-LM-Studio test profile. It is not a universal default for approximate or unvalidated runtimes.
 
+### Commands
+
+macOS / Linux:
+
+```bash
+CONTEXT_ENGINE_UPSTREAM_URL="http://127.0.0.1:1234/v1" \
+CONTEXT_GOVERNOR_MODE="govern" \
+CONTEXT_TOKEN_ESTIMATOR="auto" \
+CONTEXT_OUTPUT_RESERVE="4096" \
+CONTEXT_SAFETY_RESERVE="512" \
+CONTEXT_REASONING_STREAM="strip" \
+local-context-engine
+```
+
+Windows PowerShell:
+
+```powershell
+$env:CONTEXT_ENGINE_UPSTREAM_URL="http://127.0.0.1:1234/v1"
+$env:CONTEXT_GOVERNOR_MODE="govern"
+$env:CONTEXT_TOKEN_ESTIMATOR="auto"
+$env:CONTEXT_OUTPUT_RESERVE="4096"
+$env:CONTEXT_SAFETY_RESERVE="512"
+$env:CONTEXT_REASONING_STREAM="strip"
+local-context-engine
+```
+
 ## Daily test matrix
 
 Use fixed gateway scenarios rather than treating completion of one difficult coding investigation as the sole pass/fail signal.
@@ -189,7 +215,16 @@ Use fixed gateway scenarios rather than treating completion of one difficult cod
 
 ### 4. Reasoning compatibility
 
-With upstream Thinking enabled and `CONTEXT_REASONING_STREAM=strip`, verify at least one tool turn where metrics show reasoning observed/stripped while tool calls and terminal SSE semantics remain intact.
+With upstream Thinking enabled and `CONTEXT_REASONING_STREAM=strip`, verify at least one tool turn where metrics show:
+
+```text
+streamReasoningSeen = true
+streamReasoningStripped = true
+streamToolCallSeen = true
+streamFinishReason = tool_calls
+```
+
+Verify that tool calls, fragmented tool arguments, and terminal SSE semantics survive intact for the next turn.
 
 ## Current adversarial model set
 
@@ -211,4 +246,4 @@ Do not block `v0.2.0-alpha.1` on these unless a new test proves a core invariant
 - additional validated runtime measurement providers;
 - loop supervision or behavioral policy (expected to remain outside the core).
 
-The alpha exists so these decisions can be based on actual usage rather than continuing to expand the pre-release scope.
+The alpha exists so these decisions can be based on actual usage rather than continuing to expand the pre-release scope. It makes no promise of infinite sessions inside a 25K-token context.

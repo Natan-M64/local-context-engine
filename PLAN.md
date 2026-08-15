@@ -239,18 +239,20 @@ Additional controls:
 
 ## Current repository state
 
-The initial implementation contains:
+The repository currently implements:
 
 - strict TypeScript project setup;
 - context budget calculation;
-- conservative character-based token estimation behind a replaceable interface with explicit confidence;
-- deterministic old-tool-result eviction that retains message structure and IDs;
+- token estimation behind a replaceable interface with explicit confidence (`exact` or `approximate`), including validated exact LM Studio measurement and generic fallback;
+- deterministic old-tool-result and historical assistant tool-call argument reduction;
 - filesystem SHA-256 content store with stable handles and lifecycle metadata;
 - physically loaded runtime context discovery with a fail-closed configured fallback;
+- context governor with watermarks, hysteresis, and `protect`/`govern` modes;
+- optional streamed reasoning compatibility mode (`CONTEXT_REASONING_STREAM=passthrough|strip`);
 - OpenAI-compatible gateway, CLI, and metadata-only JSONL observability;
-- focused unit, gateway, streaming, cancellation, and sanitized replay tests.
+- comprehensive unit, gateway, streaming, cancellation, and sanitized replay tests.
 
-This early v0.1 implementation passes typecheck, tests, and production compilation. Cross-runtime integration validation remains in progress.
+This `v0.2.0-alpha.1` daily-driver testing release passes typecheck, tests, and production compilation.
 
 ## Roadmap
 
@@ -284,14 +286,23 @@ This early v0.1 implementation passes typecheck, tests, and production compilati
 - [x] Emit metadata-only token attribution before and after reduction without recording request content.
 - [x] Support opt-in metadata-only JSONL metrics from the standalone CLI.
 
-### v0.2 — Context governor
+### v0.2.0-alpha.1 — Daily-driver testing (Current)
 
-- [ ] Add message/output classification without harness-specific names.
-- [ ] Add watermarks and hysteresis.
-- [ ] Add repeated-output deduplication.
-- [ ] Add per-tool and per-turn evidence budgets.
-- [ ] Add policies for code, logs, JSON, SQL, diffs, builds, tests, and listings.
-- [ ] Add runtime/profile-specific conservative defaults.
+- [x] Message/output classification without harness-specific names (SAFE, LIVE_EVIDENCE, CAUTIOUS, PROTECTED).
+- [x] Watermarks and hysteresis in the context governor (`protect` vs `govern` modes).
+- [x] Historical assistant tool-call argument archival under hard overflow.
+- [x] Emergency archive marker compaction under narrow hard overflow.
+- [x] Exact LM Studio prompt token measurement provider via `@lmstudio/sdk`.
+- [x] Optional reasoning stream compatibility mode (`CONTEXT_REASONING_STREAM=passthrough|strip`).
+- [x] Fail-closed verification preventing oversized requests from reaching upstream.
+
+### v0.2.0-alpha.2+ Candidates (Deferred)
+
+- [ ] Atomic eviction of fully completed historical tool rounds (`HISTORICAL_TOOL_ROUND`).
+- [ ] Richer semantic-viability and retention telemetry for LIVE evidence.
+- [ ] Automatic confidence-aware safety reserve selection.
+- [ ] Repeated-output deduplication.
+- [ ] Additional validated runtime measurement adapters (Ollama, oMLX, llama.cpp, vLLM).
 
 ### v0.3 — Retrieval
 

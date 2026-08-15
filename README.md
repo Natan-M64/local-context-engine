@@ -73,17 +73,33 @@ The gateway listens on `http://127.0.0.1:18181/v1` by default. Point Kilo, OpenC
 
 For the currently validated LM Studio exact-measurement path:
 
+### macOS / Linux (bash / zsh)
+
 ```bash
-CONTEXT_ENGINE_UPSTREAM_URL=http://127.0.0.1:1234/v1 \
-CONTEXT_GOVERNOR_MODE=govern \
-CONTEXT_TOKEN_ESTIMATOR=auto \
-CONTEXT_OUTPUT_RESERVE=4096 \
-CONTEXT_SAFETY_RESERVE=512 \
-CONTEXT_REASONING_STREAM=strip \
+CONTEXT_ENGINE_UPSTREAM_URL="http://127.0.0.1:1234/v1" \
+CONTEXT_GOVERNOR_MODE="govern" \
+CONTEXT_TOKEN_ESTIMATOR="auto" \
+CONTEXT_OUTPUT_RESERVE="4096" \
+CONTEXT_SAFETY_RESERVE="512" \
+CONTEXT_REASONING_STREAM="strip" \
+local-context-engine
+```
+
+### Windows (PowerShell)
+
+```powershell
+$env:CONTEXT_ENGINE_UPSTREAM_URL="http://127.0.0.1:1234/v1"
+$env:CONTEXT_GOVERNOR_MODE="govern"
+$env:CONTEXT_TOKEN_ESTIMATOR="auto"
+$env:CONTEXT_OUTPUT_RESERVE="4096"
+$env:CONTEXT_SAFETY_RESERVE="512"
+$env:CONTEXT_REASONING_STREAM="strip"
 local-context-engine
 ```
 
 `CONTEXT_SAFETY_RESERVE=512` is a **daily-test profile for the validated exact LM Studio path**, not a universal default recommendation. Approximate/unvalidated measurement should retain a more conservative reserve.
+
+`CONTEXT_REASONING_STREAM=strip` is an opt-in compatibility workaround for streamed reasoning preceding tool calls; `passthrough` remains the default.
 
 If the client sends a valid `max_completion_tokens` or `max_tokens`, that value becomes the effective output reserve and takes precedence over `CONTEXT_OUTPUT_RESERVE`.
 
@@ -180,9 +196,23 @@ Treat the following as release blockers:
 - system/developer/latest-user/current protocol structures are incorrectly removed;
 - a reduction candidate increases authoritative whole-request tokens;
 - SSE/tool-call/content/finish semantics are corrupted by the compatibility transform;
-- archived payloads required by the current contract become unrecoverable.
+- archived payloads required by the current contract become unrecoverable;
+- cancellation, streaming, or required upstream header behavior is corrupted;
+- a request that should fail locally is sent oversized to the runtime.
 
 Do **not** block the alpha solely because a model loops, a harness reaches its step limit, or a safe deterministic request is rejected with a structured local `context_budget_exceeded`.
+
+## Beta promotion criteria
+
+Promote from alpha to beta only after 5–7 days of real use without:
+
+- oversized requests reaching upstream;
+- protocol corruption;
+- silent exact-to-approximate measurement downgrade;
+- loss of CAS recoverability;
+- streaming or reasoning-compatibility regressions.
+
+Beta readiness measures gateway stability. It does not require zero model loops, task failures, step-limit terminations, or legitimate local `context_budget_exceeded` responses.
 
 ## Health check
 
